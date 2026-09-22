@@ -1,0 +1,9 @@
+{
+  "id": "typed-calendar",
+  "name": "Typed Calendar",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Typed, multi-tagged calendar events with priority and expecting-soon views, plus two-way iCloud CalDAV sync.",
+  "author": "Alex",
+  "isDesktopOnly": true
+}

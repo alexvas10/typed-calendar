@@ -1,0 +1,32 @@
+{
+  "name": "typed-calendar",
+  "version": "0.1.0",
+  "description": "Typed calendar events for Obsidian with iCloud CalDAV sync.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "rm -rf /tmp/tc-tests && esbuild tests/*.test.ts --bundle --platform=node --format=esm --outdir=/tmp/tc-tests --log-level=error && node --test /tmp/tc-tests",
+    "push:check": "esbuild tests/push.check.ts --bundle --platform=node --format=esm --outfile=/tmp/tc-push.mjs --external:node:https --external:node:http --external:node:fs --log-level=error && node /tmp/tc-push.mjs",
+    "live": "esbuild tests/live.check.ts --bundle --platform=node --format=esm --outfile=/tmp/tc-live.mjs --external:node:https --external:node:http --external:node:fs --log-level=error && node /tmp/tc-live.mjs"
+  },
+  "keywords": [],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@xmldom/xmldom": "^0.9.12",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "tslib": "^2.8.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@fullcalendar/core": "^6.1.21",
+    "@fullcalendar/daygrid": "^6.1.21",
+    "@fullcalendar/interaction": "^6.1.21",
+    "@fullcalendar/list": "^6.1.21",
+    "@fullcalendar/timegrid": "^6.1.21",
+    "ical.js": "^2.2.1"
+  }
+}
