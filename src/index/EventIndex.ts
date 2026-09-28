@@ -1,8 +1,16 @@
-import { App, Component, TAbstractFile, TFile } from "obsidian";
+import { App, Component, TAbstractFile, TFile, debounce } from "obsidian";
 import { CalendarEvent, isScheduled } from "../model/types";
 import { eventFromFrontmatter } from "../model/serialize";
 
 type Listener = () => void;
+
+/**
+ * How long a burst of changes is gathered before listeners hear about it. A
+ * sync that updates 60 notes fires 60 cache events; without this every open
+ * view redrew itself 60 times. Short enough that an edit still feels
+ * immediate.
+ */
+const NOTIFY_DELAY_MS = 150;
 
 /**
  * Keeps an in-memory view of every event note under the configured folder.
@@ -16,6 +24,18 @@ export class EventIndex extends Component {
 	private events = new Map<string, CalendarEvent>();
 	private listeners = new Set<Listener>();
 	private folder: string;
+	/**
+	 * Not reset by later calls, so a long burst still redraws every
+	 * NOTIFY_DELAY_MS rather than going quiet until it ends. Reads (all(),
+	 * byUid()...) are never delayed -- only the change broadcast is.
+	 */
+	private readonly broadcast = debounce(
+		() => {
+			for (const listener of this.listeners) listener();
+		},
+		NOTIFY_DELAY_MS,
+		false
+	);
 
 	constructor(private app: App, folder: string) {
 		super();
@@ -67,6 +87,7 @@ export class EventIndex extends Component {
 	}
 
 	onunload(): void {
+		this.broadcast.cancel();
 		this.listeners.clear();
 		this.events.clear();
 	}
@@ -141,7 +162,7 @@ export class EventIndex extends Component {
 	}
 
 	private notify(): void {
-		for (const listener of this.listeners) listener();
+		this.broadcast();
 	}
 }
 

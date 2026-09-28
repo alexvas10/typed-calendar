@@ -1,5 +1,5 @@
 import { CalendarEvent, EventType } from "./types";
-import { expandOccurrences } from "./recurrence";
+import { expandEvent } from "./occurrences";
 import { addDays, daysUntil, startOfToday, toDateString } from "../util/dates";
 
 export interface PriorityRow {
@@ -7,8 +7,13 @@ export interface PriorityRow {
 	/**
 	 * The date this row is about. For a repeating event it is one occurrence,
 	 * not the series start, so a weekly class shows up on each of its days.
+	 * A moved occurrence is listed on the date it moved to.
 	 */
 	date: string;
+	/** The date the rule gave this occurrence, which is what skipping acts on. */
+	occurrence: string;
+	/** The occurrence's own title, when it was renamed on its own. */
+	title: string;
 	days: number;
 	/** Type-declared fields marked showInPriority, already formatted. */
 	annotations: string[];
@@ -84,15 +89,19 @@ export function buildPriorityRows(
 		if (!event.date) continue;
 		// A repeating event contributes every occurrence inside the horizon;
 		// a single one contributes itself, or nothing when it falls outside.
-		const occurrences = expandOccurrences(event.date, event.recurrence, event.exceptions ?? [], {
-			from,
-			to,
-		});
-		const annotations = annotationsFor(event, typeMap);
-		for (const date of occurrences) {
-			const days = daysUntil(date, today);
+		for (const instance of expandEvent(event, { from, to })) {
+			const days = daysUntil(instance.date, today);
 			if (days === null) continue;
-			rows.push({ event, date, days, annotations });
+			rows.push({
+				event,
+				date: instance.date,
+				occurrence: instance.occurrence,
+				title: instance.title,
+				days,
+				// A room change on one occurrence is exactly what this list is
+				// for noticing, so the annotations follow the occurrence.
+				annotations: annotationsFor({ ...event, location: instance.location }, typeMap),
+			});
 		}
 	}
 
@@ -102,7 +111,7 @@ export function buildPriorityRows(
 		if (rankDelta !== 0) return rankDelta;
 		const weightDelta = weightOf(b.event, typeMap) - weightOf(a.event, typeMap);
 		if (weightDelta !== 0) return weightDelta;
-		return a.event.title.localeCompare(b.event.title);
+		return a.title.localeCompare(b.title);
 	});
 
 	return rows;

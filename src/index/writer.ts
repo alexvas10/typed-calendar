@@ -39,7 +39,16 @@ export async function writeEventNote(
 	isNew: boolean
 ): Promise<TFile> {
 	if (!event.uid) event.uid = generateUid();
-	event.icloud = { ...event.icloud, localModified: new Date().toISOString() };
+	const now = new Date().toISOString();
+	event.icloud = { ...event.icloud, localModified: now };
+	// Every other service this note is linked to is now behind it too. This is
+	// what carries a change across services: a pull from iCloud rewrites the
+	// note, which marks the Google copy stale, which the Google pass pushes.
+	// The service a pull came from realigns its own stamp afterwards.
+	for (const key of ["google", "outlook"] as const) {
+		const binding = event[key];
+		if (binding?.href) event[key] = { ...binding, localModified: now };
+	}
 
 	if (isNew) {
 		await ensureFolder(app, folder);

@@ -4,6 +4,8 @@
    --tc-row-color custom properties set inline by the views. */
 
 .tc-view {
+	/* The types popover is positioned against the view. */
+	position: relative;
 	display: flex;
 	flex-direction: column;
 	height: 100%;
@@ -71,7 +73,7 @@
 	padding: 4px 12px 12px;
 }
 
-.tc-calendar-grid .fc {
+.tc-calendar-grid.fc {
 	--fc-border-color: var(--background-modifier-border);
 	--fc-page-bg-color: transparent;
 	--fc-neutral-bg-color: var(--background-secondary);
@@ -89,19 +91,19 @@
 
 /* ---- toolbar ---- */
 
-.tc-calendar-grid .fc .fc-toolbar.fc-header-toolbar {
+.tc-calendar-grid.fc .fc-toolbar.fc-header-toolbar {
 	margin-bottom: 10px;
 	gap: 8px;
 	flex-wrap: wrap;
 }
 
-.tc-calendar-grid .fc .fc-toolbar-title {
+.tc-calendar-grid.fc .fc-toolbar-title {
 	font-size: var(--font-ui-large);
 	font-weight: 650;
 	letter-spacing: -0.01em;
 }
 
-.tc-calendar-grid .fc .fc-button {
+.tc-calendar-grid.fc .fc-button {
 	background: transparent;
 	border-color: transparent;
 	color: var(--text-muted);
@@ -114,57 +116,57 @@
 	transition: background 120ms ease, color 120ms ease;
 }
 
-.tc-calendar-grid .fc .fc-button:hover {
+.tc-calendar-grid.fc .fc-button:hover {
 	background: var(--background-modifier-hover);
 	color: var(--text-normal);
 }
 
-.tc-calendar-grid .fc .fc-button:focus-visible {
+.tc-calendar-grid.fc .fc-button:focus-visible {
 	box-shadow: 0 0 0 2px var(--background-modifier-border-focus);
 }
 
 /* The view switcher reads as one segmented control rather than three buttons. */
-.tc-calendar-grid .fc .fc-button-group {
+.tc-calendar-grid.fc .fc-button-group {
 	background: var(--background-secondary);
 	border-radius: var(--radius-m);
 	padding: 2px;
 	gap: 2px;
 }
 
-.tc-calendar-grid .fc .fc-button-group .fc-button {
+.tc-calendar-grid.fc .fc-button-group .fc-button {
 	border-radius: var(--radius-s) !important;
 }
 
-.tc-calendar-grid .fc .fc-button-primary:not(:disabled).fc-button-active {
+.tc-calendar-grid.fc .fc-button-primary:not(:disabled).fc-button-active {
 	background: var(--tc-surface);
 	border-color: transparent;
 	color: var(--text-normal);
 	box-shadow: var(--shadow-s);
 }
 
-.tc-calendar-grid .fc .fc-today-button:disabled {
+.tc-calendar-grid.fc .fc-today-button:disabled {
 	opacity: 0.4;
 }
 
 /* ---- grid frame ---- */
 
-.tc-calendar-grid .fc .fc-view-harness {
+.tc-calendar-grid.fc .fc-view-harness {
 	border: 1px solid var(--background-modifier-border);
 	border-radius: var(--radius-m);
 	overflow: hidden;
 	background: var(--tc-surface);
 }
 
-.tc-calendar-grid .fc .fc-scrollgrid {
+.tc-calendar-grid.fc .fc-scrollgrid {
 	border: none;
 }
 
-.tc-calendar-grid .fc th {
+.tc-calendar-grid.fc th {
 	border-color: var(--background-modifier-border);
 	background: var(--background-secondary);
 }
 
-.tc-calendar-grid .fc .fc-col-header-cell-cushion {
+.tc-calendar-grid.fc .fc-col-header-cell-cushion {
 	padding: 7px 4px;
 	font-size: var(--font-ui-smaller);
 	font-weight: 600;
@@ -173,25 +175,25 @@
 	color: var(--text-muted);
 }
 
-.tc-calendar-grid .fc .fc-day-sat,
-.tc-calendar-grid .fc .fc-day-sun {
+.tc-calendar-grid.fc .fc-day-sat,
+.tc-calendar-grid.fc .fc-day-sun {
 	background: var(--tc-weekend);
 }
 
-.tc-calendar-grid .fc .fc-daygrid-day-number {
+.tc-calendar-grid.fc .fc-daygrid-day-number {
 	padding: 5px 7px;
 	font-size: var(--font-ui-smaller);
 	font-variant-numeric: tabular-nums;
 	color: var(--text-muted);
 }
 
-.tc-calendar-grid .fc .fc-day-other .fc-daygrid-day-number {
+.tc-calendar-grid.fc .fc-day-other .fc-daygrid-day-number {
 	color: var(--text-faint);
 }
 
 /* Today is marked on the date itself, not by flooding the whole cell: a filled
    cell fights with every event drawn inside it. */
-.tc-calendar-grid .fc .fc-day-today .fc-daygrid-day-number {
+.tc-calendar-grid.fc .fc-day-today .fc-daygrid-day-number {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
@@ -205,49 +207,60 @@
 	font-weight: 600;
 }
 
-.tc-calendar-grid .fc .fc-daygrid-day-frame {
+.tc-calendar-grid.fc .fc-daygrid-day-frame {
 	min-height: 5.5em;
 }
 
 /* ---- events ---- */
 
-.tc-calendar-grid .fc .fc-event {
+.tc-calendar-grid.fc .fc-event {
 	--tc-event-color: var(--interactive-accent);
 	cursor: pointer;
 	border: none;
 	border-radius: var(--radius-s);
 	background: transparent;
 	font-size: var(--font-ui-smaller);
+}
+
+/* Animated on hover only. An event is drawn before its type colour is set
+   (FullCalendar mounts it, then eventDidMount sets --tc-event-color), so a
+   transition on the base rule would fade every event in from the accent
+   colour on each redraw. */
+.tc-calendar-grid.fc .fc-event:hover {
+	transform: translateY(-1px);
 	transition: background 120ms ease, transform 120ms ease;
 }
 
-.tc-calendar-grid .fc .fc-event:hover {
-	transform: translateY(-1px);
-}
-
-.tc-calendar-grid .fc .fc-event .fc-event-main {
+.tc-calendar-grid.fc .fc-event .fc-event-main {
 	color: var(--text-normal);
 }
 
 /* An all-day block is a tinted pill with an accent edge -- readable on both
    themes, where a saturated fill with white text is not. */
-.tc-calendar-grid .fc .fc-daygrid-event.tc-event {
+.tc-calendar-grid.fc .fc-daygrid-event.tc-event {
 	margin: 1px 4px;
 	padding: 1px 6px;
 	background: color-mix(in srgb, var(--tc-event-color) 20%, var(--tc-surface));
 	border-left: 3px solid var(--tc-event-color);
 }
 
-.tc-calendar-grid .fc .fc-daygrid-event.tc-event:hover {
+.tc-calendar-grid.fc .fc-daygrid-event.tc-event:hover {
 	background: color-mix(in srgb, var(--tc-event-color) 32%, var(--tc-surface));
 }
 
-.tc-calendar-grid .fc .fc-daygrid-event .fc-event-time {
+/* In the month grid a timed event is drawn as a dot beside its time, and
+   FullCalendar colours that dot from its own default -- a blue that has
+   nothing to do with the event's type. */
+.tc-calendar-grid.fc .fc-daygrid-event-dot {
+	border-color: var(--tc-event-color);
+}
+
+.tc-calendar-grid.fc .fc-daygrid-event .fc-event-time {
 	font-weight: 600;
 	opacity: 0.75;
 }
 
-.tc-calendar-grid .fc .fc-daygrid-event .fc-event-title {
+.tc-calendar-grid.fc .fc-daygrid-event .fc-event-title {
 	font-weight: 500;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -255,50 +268,57 @@
 
 /* Timed blocks in the week grid carry the colour more strongly, because they
    sit on an empty background rather than beside a date number. */
-.tc-calendar-grid .fc .fc-timegrid-event.tc-event {
+.tc-calendar-grid.fc .fc-timegrid-event.tc-event {
 	background: color-mix(in srgb, var(--tc-event-color) 26%, var(--tc-surface));
 	border-left: 3px solid var(--tc-event-color);
 	box-shadow: none;
 	padding: 1px 2px;
 }
 
-.tc-calendar-grid .fc .fc-timegrid-event.tc-event:hover {
+.tc-calendar-grid.fc .fc-timegrid-event.tc-event:hover {
 	background: color-mix(in srgb, var(--tc-event-color) 38%, var(--tc-surface));
 }
 
-.tc-calendar-grid .fc .fc-daygrid-more-link {
+/* An occurrence changed on its own -- moved, retimed, another room -- keeps its
+   type colour but trades the solid edge for a dashed one, so a week that is
+   not like the others is visible at a glance. */
+.tc-calendar-grid.fc .tc-event.tc-event-changed {
+	border-left-style: dashed;
+}
+
+.tc-calendar-grid.fc .fc-daygrid-more-link {
 	font-size: var(--font-ui-smaller);
 	color: var(--text-muted);
 	padding: 0 6px;
 }
 
-.tc-calendar-grid .fc .fc-daygrid-more-link:hover {
+.tc-calendar-grid.fc .fc-daygrid-more-link:hover {
 	color: var(--text-accent);
 }
 
 /* ---- week / agenda ---- */
 
-.tc-calendar-grid .fc .fc-timegrid-slot {
+.tc-calendar-grid.fc .fc-timegrid-slot {
 	height: 2.2em;
 }
 
-.tc-calendar-grid .fc .fc-timegrid-slot-label-cushion {
+.tc-calendar-grid.fc .fc-timegrid-slot-label-cushion {
 	font-size: var(--font-ui-smaller);
 	color: var(--text-faint);
 	font-variant-numeric: tabular-nums;
 }
 
 /* Half-hour lines dashed, hour lines solid: the hour is what you scan for. */
-.tc-calendar-grid .fc .fc-timegrid-slot-minor {
+.tc-calendar-grid.fc .fc-timegrid-slot-minor {
 	border-top-style: dashed;
 	border-top-color: color-mix(in srgb, var(--background-modifier-border) 55%, transparent);
 }
 
-.tc-calendar-grid .fc .fc-list {
+.tc-calendar-grid.fc .fc-list {
 	border: none;
 }
 
-.tc-calendar-grid .fc .fc-list-day-cushion {
+.tc-calendar-grid.fc .fc-list-day-cushion {
 	background: var(--background-secondary);
 	font-size: var(--font-ui-smaller);
 	letter-spacing: 0.04em;
@@ -306,20 +326,20 @@
 	color: var(--text-muted);
 }
 
-.tc-calendar-grid .fc .fc-list-event td {
+.tc-calendar-grid.fc .fc-list-event td {
 	cursor: pointer;
 	font-size: var(--font-ui-small);
 }
 
-.tc-calendar-grid .fc .fc-list-event-dot {
+.tc-calendar-grid.fc .fc-list-event-dot {
 	border-color: var(--tc-event-color);
 }
 
-.tc-calendar-grid .fc .fc-list-event-title {
+.tc-calendar-grid.fc .fc-list-event-title {
 	font-weight: 500;
 }
 
-.tc-calendar-grid .fc .fc-list-empty {
+.tc-calendar-grid.fc .fc-list-empty {
 	background: transparent;
 	color: var(--text-faint);
 }
@@ -486,4 +506,292 @@
 .tc-chip-add:hover {
 	border-style: solid;
 	color: var(--text-accent);
+}
+
+/* ---- toolbar actions: new event, types, awaiting ---- */
+
+/* The one primary action in the toolbar. */
+.tc-calendar-grid.fc .fc-tcNew-button {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+	font-weight: 600;
+}
+
+.tc-calendar-grid.fc .fc-tcNew-button:hover {
+	background: var(--interactive-accent-hover);
+	color: var(--text-on-accent);
+}
+
+.tc-calendar-grid.fc .fc-tcTypes-button {
+	border: 1px solid var(--background-modifier-border);
+}
+
+/* A filter is quietly hiding events: make that visible from the toolbar. */
+.tc-calendar-grid.fc.tc-filtered .fc-tcTypes-button {
+	border-color: var(--interactive-accent);
+	color: var(--text-accent);
+}
+
+.tc-calendar-grid.fc .fc-tcAwaiting-button {
+	color: var(--text-warning);
+}
+
+.tc-calendar-grid.fc.tc-no-awaiting .fc-tcAwaiting-button {
+	display: none;
+}
+
+/* The title opens the date picker. */
+.tc-calendar-grid.fc .fc-toolbar-title {
+	cursor: pointer;
+	border-radius: var(--radius-s);
+	padding: 0 6px;
+}
+
+.tc-calendar-grid.fc .fc-toolbar-title:hover {
+	background: var(--background-modifier-hover);
+}
+
+.tc-types-popover {
+	position: absolute;
+	z-index: 20;
+	width: min(340px, calc(100% - 16px));
+	padding: 10px 12px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	background: var(--background-primary);
+	box-shadow: var(--shadow-l);
+}
+
+.tc-types-popover .tc-filter-bar {
+	padding: 6px 0;
+	border-bottom: none;
+}
+
+.tc-types-popover-title {
+	font-size: var(--font-ui-smaller);
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--text-muted);
+}
+
+.tc-types-popover-hint {
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+}
+
+/* ---- year view ---- */
+
+.tc-calendar-grid.fc .fc-multimonth {
+	border: none;
+}
+
+.tc-calendar-grid.fc .fc-multimonth-title {
+	font-size: var(--font-ui-small);
+	font-weight: 650;
+	padding: 8px 0 4px;
+}
+
+.tc-calendar-grid.fc .fc-multimonth-header {
+	background: transparent;
+}
+
+/* In the overview an event is a thin bar in its type colour: enough to see
+   which days are busy and with what, with nothing to truncate. The hover card
+   carries the details. */
+.tc-calendar-grid.fc .fc-multimonth .fc-daygrid-event.tc-event {
+	height: 4px;
+	margin: 1px 3px;
+	padding: 0;
+	border: none;
+	border-radius: 2px;
+	background: var(--tc-event-color);
+}
+
+.tc-calendar-grid.fc .fc-multimonth .fc-daygrid-event .fc-event-main,
+.tc-calendar-grid.fc .fc-multimonth .fc-daygrid-event-dot,
+.tc-calendar-grid.fc .fc-multimonth .fc-event-time,
+.tc-calendar-grid.fc .fc-multimonth .fc-event-title {
+	display: none;
+}
+
+.tc-calendar-grid.fc .fc-multimonth .fc-daygrid-day-frame {
+	min-height: 3.2em;
+}
+
+.tc-calendar-grid.fc .fc-multimonth .fc-daygrid-more-link {
+	font-size: 10px;
+	padding: 0 3px;
+}
+
+/* ---- interactions ---- */
+
+/* Locked events cannot be dragged; say so with the cursor. */
+.tc-calendar-grid.fc .tc-event-locked {
+	cursor: default;
+}
+
+.tc-calendar-grid.fc .fc-highlight {
+	background: color-mix(in srgb, var(--interactive-accent) 14%, transparent);
+}
+
+.tc-hover-card {
+	--tc-event-color: var(--interactive-accent);
+	position: fixed;
+	z-index: var(--layer-tooltip, 60);
+	max-width: 300px;
+	padding: 9px 12px 10px;
+	border: 1px solid var(--background-modifier-border);
+	border-left: 3px solid var(--tc-event-color);
+	border-radius: var(--radius-m);
+	background: var(--background-primary);
+	box-shadow: var(--shadow-l);
+	font-size: var(--font-ui-smaller);
+	pointer-events: none;
+}
+
+.tc-hover-title {
+	font-size: var(--font-ui-small);
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.tc-hover-when {
+	margin-top: 2px;
+	color: var(--text-muted);
+	font-variant-numeric: tabular-nums;
+}
+
+.tc-hover-types {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin-top: 7px;
+}
+
+.tc-hover-details {
+	margin-top: 6px;
+	color: var(--text-normal);
+}
+
+.tc-hover-note {
+	margin-top: 4px;
+	color: var(--text-faint);
+}
+
+/* ---- jump to date ---- */
+
+.tc-jump-stepper {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	margin-bottom: 12px;
+}
+
+.tc-jump-year {
+	width: 6em;
+	text-align: center;
+	font-size: var(--font-ui-large);
+	font-weight: 650;
+}
+
+.tc-jump-months {
+	display: grid;
+	grid-template-columns: repeat(4, 1fr);
+	gap: 6px;
+}
+
+.tc-jump-month.is-current {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.tc-jump-month.is-today:not(.is-current) {
+	box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+
+.tc-jump-footer {
+	display: flex;
+	justify-content: flex-end;
+	margin-top: 12px;
+}
+
+/* ---- time picker ---- */
+
+.tc-time-input {
+	width: 12.5em;
+	font-variant-numeric: tabular-nums;
+	cursor: pointer;
+}
+
+.tc-time-input:focus {
+	cursor: text;
+}
+
+.tc-time-input.is-invalid {
+	border-color: var(--text-error);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-error) 25%, transparent);
+}
+
+/* Above the modal it opens from: attached to the body so it is never clipped. */
+.tc-time-popup {
+	position: fixed;
+	z-index: var(--layer-menu, 65);
+	padding: 4px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-m);
+	background: var(--background-primary);
+	box-shadow: var(--shadow-l);
+}
+
+.tc-time-list {
+	max-height: 264px;
+	overflow-y: auto;
+	/* The scrollbar should not shift the columns as the list opens. */
+	scrollbar-gutter: stable;
+}
+
+.tc-time-option {
+	display: flex;
+	justify-content: space-between;
+	gap: 18px;
+	padding: 5px 10px;
+	border-radius: var(--radius-s);
+	font-size: var(--font-ui-small);
+	font-variant-numeric: tabular-nums;
+	color: var(--text-normal);
+	cursor: pointer;
+	white-space: nowrap;
+}
+
+.tc-time-option.is-active {
+	background: var(--background-modifier-hover);
+}
+
+.tc-time-option.is-selected {
+	background: color-mix(in srgb, var(--interactive-accent) 16%, transparent);
+	color: var(--text-accent);
+	font-weight: 600;
+}
+
+.tc-time-detail {
+	color: var(--text-faint);
+	font-size: var(--font-ui-smaller);
+}
+
+/* "Custom end time…" leads to the full list: set apart from the lengths. */
+.tc-time-divider {
+	position: relative;
+	margin-top: 9px;
+	color: var(--text-muted);
+}
+
+.tc-time-divider::before {
+	content: "";
+	position: absolute;
+	top: -5px;
+	left: 6px;
+	right: 6px;
+	border-top: 1px solid var(--background-modifier-border);
 }

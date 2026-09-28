@@ -5,6 +5,10 @@ import {
 	expandOccurrences,
 	parseExceptions,
 	parseRecurrence,
+	positionInMonth,
+	positionModeOf,
+	positionRule,
+	recurrenceToFrontmatter,
 } from "../src/model/recurrence";
 import { formatRRule, parseRRule, sameRule } from "../src/sync/rrule";
 
@@ -112,12 +116,44 @@ test("a block with no usable frequency is not a rule", () => {
 	assert.equal(parseRecurrence("weekly"), null);
 });
 
-test("byDay is ignored where it would mean positioning", () => {
-	// "the third Monday of the month" is outside the supported subset.
-	assert.deepEqual(parseRecurrence({ freq: "monthly", byDay: ["MO"] }), {
+test("byDay reads positioned weekdays alongside plain ones", () => {
+	assert.deepEqual(parseRecurrence({ freq: "monthly", byDay: ["2tu", "-1FR"] }), {
+		freq: "monthly",
+		interval: 1,
+		byNthDay: [{ nth: -1, day: "FR" }, { nth: 2, day: "TU" }],
+	});
+	// The last weekday of the month: every weekday, narrowed to the last one.
+	assert.deepEqual(
+		parseRecurrence({ freq: "monthly", byDay: "MO,TU,WE,TH,FR", bySetPos: -1 }),
+		{ freq: "monthly", interval: 1, byDay: ["MO", "TU", "WE", "TH", "FR"], bySetPos: [-1] }
+	);
+});
+
+test("parts a frequency cannot carry are dropped, not guessed at", () => {
+	// A position on a weekly rule has nothing to position within.
+	assert.deepEqual(parseRecurrence({ freq: "weekly", byDay: ["2TU", "WE"] }), {
+		freq: "weekly",
+		interval: 1,
+		byDay: ["WE"],
+	});
+	// A yearly "second Tuesday" without a month would be the second Tuesday
+	// of the year; the day part goes and a plain yearly rule remains.
+	assert.deepEqual(parseRecurrence({ freq: "yearly", byDay: ["2TU"] }), {
+		freq: "yearly",
+		interval: 1,
+	});
+	assert.deepEqual(parseRecurrence({ freq: "monthly", byDay: ["9TU"], byMonthDay: [0, 40] }), {
 		freq: "monthly",
 		interval: 1,
 	});
+});
+
+test("a positioned rule survives a frontmatter round trip", () => {
+	const rule = parseRecurrence({ freq: "yearly", byMonth: [11], byDay: ["4TH"] })!;
+	assert.deepEqual(recurrenceToFrontmatter(rule), {
+		freq: "yearly", interval: 1, byDay: ["4TH"], byMonth: [11],
+	});
+	assert.deepEqual(parseRecurrence(recurrenceToFrontmatter(rule)), rule);
 });
 
 test("until wins over count, since they cannot both apply", () => {
@@ -154,10 +190,17 @@ test("an until we write keeps the final occurrence", () => {
 
 test("rules outside the writable subset are refused, not guessed at", () => {
 	for (const rrule of [
-		"FREQ=MONTHLY;BYDAY=2TU",
-		"FREQ=MONTHLY;BYMONTHDAY=13",
 		"FREQ=WEEKLY;BYSETPOS=1;BYDAY=MO",
+		"FREQ=WEEKLY;BYDAY=2MO",
 		"FREQ=WEEKLY;INTERVAL=2;WKST=MO",
+		"FREQ=DAILY;BYDAY=MO,TU",
+		"FREQ=MONTHLY;BYMONTH=3",
+		"FREQ=MONTHLY;BYDAY=6TU",
+		"FREQ=MONTHLY;BYMONTHDAY=0",
+		"FREQ=MONTHLY;BYSETPOS=1",
+		"FREQ=YEARLY;BYDAY=20MO",
+		"FREQ=YEARLY;BYWEEKNO=20;BYDAY=MO",
+		"FREQ=YEARLY;BYYEARDAY=100",
 		"FREQ=HOURLY",
 		"BYDAY=MO",
 	]) {
@@ -183,4 +226,204 @@ test("the human summary explains the ordering of a real class", () => {
 		describeRecurrence({ freq: "weekly", interval: 2, byDay: ["TU"] }),
 		"Every 2 weeks on Tue"
 	);
+});
+
+// --- positional rules ---------------------------------------------------------
+
+const H1 = { from: "2026-01-01", to: "2026-06-30" };
+
+test("the second Tuesday lands on the second Tuesday of every month", () => {
+	const dates = expandOccurrences(
+		"2026-01-13",
+		{ freq: "monthly", interval: 1, byNthDay: [{ nth: 2, day: "TU" }] },
+		[],
+		H1
+	);
+	assert.deepEqual(dates, [
+		"2026-01-13", "2026-02-10", "2026-03-10", "2026-04-14", "2026-05-12", "2026-06-09",
+	]);
+});
+
+test("the last Friday counts back from the end of each month", () => {
+	const dates = expandOccurrences(
+		"2026-01-30",
+		{ freq: "monthly", interval: 1, byNthDay: [{ nth: -1, day: "FR" }] },
+		[],
+		H1
+	);
+	assert.deepEqual(dates, [
+		"2026-01-30", "2026-02-27", "2026-03-27", "2026-04-24", "2026-05-29", "2026-06-26",
+	]);
+});
+
+test("the last weekday of the month is every weekday narrowed by set position", () => {
+	// Apple's "On the last weekday": BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1.
+	const rule = parseRRule("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", TO)!;
+	assert.deepEqual(expandOccurrences("2026-01-30", rule, [], H1), [
+		"2026-01-30", "2026-02-27", "2026-03-31", "2026-04-30", "2026-05-29", "2026-06-30",
+	]);
+});
+
+test("a fifth Friday is skipped in months that have only four", () => {
+	const dates = expandOccurrences(
+		"2026-01-30",
+		{ freq: "monthly", interval: 1, byNthDay: [{ nth: 5, day: "FR" }] },
+		[],
+		{ from: "2026-01-01", to: "2026-12-31" }
+	);
+	assert.deepEqual(dates, ["2026-01-30", "2026-05-29", "2026-07-31", "2026-10-30"]);
+});
+
+test("month days and weekdays intersect: Friday the 13th", () => {
+	const rule = parseRRule("FREQ=MONTHLY;BYDAY=FR;BYMONTHDAY=13", TO)!;
+	assert.deepEqual(
+		expandOccurrences("2026-02-13", rule, [], { from: "2026-01-01", to: "2027-12-31" }),
+		["2026-02-13", "2026-03-13", "2026-11-13", "2027-08-13"]
+	);
+});
+
+test("the 1st and 15th, and the last day of the month", () => {
+	assert.deepEqual(
+		expandOccurrences("2026-01-01", { freq: "monthly", interval: 1, byMonthDay: [1, 15] }, [], {
+			from: "2026-01-01",
+			to: "2026-02-28",
+		}),
+		["2026-01-01", "2026-01-15", "2026-02-01", "2026-02-15"]
+	);
+	assert.deepEqual(
+		expandOccurrences("2026-01-31", { freq: "monthly", interval: 1, byMonthDay: [-1] }, [], {
+			from: "2026-01-01",
+			to: "2026-04-30",
+		}),
+		["2026-01-31", "2026-02-28", "2026-03-31", "2026-04-30"]
+	);
+});
+
+test("an interval skips whole months of a positional rule", () => {
+	const dates = expandOccurrences(
+		"2026-01-13",
+		{ freq: "monthly", interval: 2, byNthDay: [{ nth: 2, day: "TU" }] },
+		[],
+		H1
+	);
+	assert.deepEqual(dates, ["2026-01-13", "2026-03-10", "2026-05-12"]);
+});
+
+test("a yearly positional rule: the fourth Thursday of November", () => {
+	const rule = parseRRule("FREQ=YEARLY;BYMONTH=11;BYDAY=4TH", TO)!;
+	assert.deepEqual(
+		expandOccurrences("2026-11-26", rule, [], { from: "2026-01-01", to: "2029-12-31" }),
+		["2026-11-26", "2027-11-25", "2028-11-23", "2029-11-22"]
+	);
+});
+
+test("count and exceptions behave on a positional rule as on any other", () => {
+	const rule = { freq: "monthly" as const, interval: 1, byNthDay: [{ nth: 2, day: "TU" as const }], count: 3 };
+	assert.deepEqual(expandOccurrences("2026-01-13", rule, ["2026-02-10"], H1), [
+		"2026-01-13", "2026-03-10",
+	]);
+});
+
+test("a positional rule long underway still renders this month", () => {
+	const dates = expandOccurrences(
+		"2010-01-12",
+		{ freq: "monthly", interval: 1, byNthDay: [{ nth: 2, day: "TU" }] },
+		[],
+		{ from: "2026-03-01", to: "2026-03-31" }
+	);
+	assert.deepEqual(dates, ["2026-03-10"]);
+});
+
+test("positional RRULEs round-trip, whatever order the server wrote them in", () => {
+	for (const rrule of [
+		"FREQ=MONTHLY;BYDAY=2TU",
+		"FREQ=MONTHLY;BYDAY=-1FR",
+		"FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2",
+		"FREQ=MONTHLY;BYMONTHDAY=1,15",
+		"FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=-1",
+		"FREQ=YEARLY;BYMONTH=11;BYDAY=4TH",
+		"FREQ=YEARLY;BYMONTH=3,9",
+	]) {
+		const rule = parseRRule(rrule, TO);
+		assert.ok(rule, `refused ${rrule}`);
+		const again = parseRRule(formatRRule(rule, TO, false), TO);
+		assert.deepEqual(again, rule, `${rrule} did not survive a round trip`);
+	}
+	// Same rule, different spelling: not an edit.
+	assert.ok(
+		sameRule(
+			parseRRule("FREQ=MONTHLY;BYDAY=FR,MO;BYSETPOS=-1", TO)!,
+			parseRRule("FREQ=MONTHLY;BYSETPOS=-1;BYDAY=MO,FR;WKST=SU", TO)!,
+			TO,
+			false
+		)
+	);
+});
+
+test("positional rules are described the way a person would say them", () => {
+	assert.equal(
+		describeRecurrence({ freq: "monthly", interval: 1, byNthDay: [{ nth: 2, day: "TU" }] }),
+		"Every month on the 2nd Tue"
+	);
+	assert.equal(
+		describeRecurrence({ freq: "monthly", interval: 1, byNthDay: [{ nth: -1, day: "FR" }] }),
+		"Every month on the last Fri"
+	);
+	assert.equal(
+		describeRecurrence({
+			freq: "monthly", interval: 1, byDay: ["MO", "TU", "WE", "TH", "FR"], bySetPos: [-1],
+		}),
+		"Every month on the last weekday"
+	);
+	assert.equal(
+		describeRecurrence({ freq: "monthly", interval: 1, byMonthDay: [1, 15] }),
+		"Every month on the 1st and the 15th"
+	);
+	assert.equal(
+		describeRecurrence({
+			freq: "yearly", interval: 1, byMonth: [11], byNthDay: [{ nth: 4, day: "TH" }],
+		}),
+		"Every year in Nov on the 4th Thu"
+	);
+});
+
+test("the editor's options are worked out from the start date", () => {
+	// 31 Mar 2026 is the fifth, and so the last, Tuesday.
+	assert.deepEqual(positionInMonth("2026-03-31"), { nth: 5, day: "TU", isLast: true });
+	assert.deepEqual(positionInMonth("2026-03-24"), { nth: 4, day: "TU", isLast: false });
+
+	const monthly = { freq: "monthly" as const, interval: 1, until: "2026-12-31" };
+	const nth = positionRule(monthly, "nth", "2026-03-24");
+	assert.deepEqual(nth, { ...monthly, byNthDay: [{ nth: 4, day: "TU" }] });
+	assert.equal(positionModeOf(nth, "2026-03-24"), "nth");
+	assert.equal(positionModeOf(positionRule(monthly, "last", "2026-03-31"), "2026-03-31"), "last");
+	assert.equal(positionModeOf(monthly, "2026-03-24"), "day");
+	assert.equal(
+		positionModeOf({ ...monthly, byMonthDay: [1, 15] }, "2026-03-24"),
+		"custom",
+		"a rule the editor did not build is not rebuilt by it"
+	);
+
+	const yearly = positionRule({ freq: "yearly", interval: 1 }, "nth", "2026-11-26");
+	assert.deepEqual(yearly, {
+		freq: "yearly", interval: 1, byNthDay: [{ nth: 4, day: "TH" }], byMonth: [11],
+	});
+});
+
+test("a plain weekly rule with no weekdays repeats every week from its start", () => {
+	// The shape of the user's fall-2024 courses: FREQ=WEEKLY, no BYDAY. It used
+	// to draw as a single event, because stepping had no weekly case.
+	const cs1020 = parseRecurrence({ freq: "weekly", interval: 1, until: "2024-12-02" })!;
+	const dates = expandOccurrences("2024-10-07", cs1020, [], { from: "2024-10-01", to: "2024-12-31" });
+	assert.equal(dates.length, 9);
+	assert.deepEqual(dates.slice(0, 3), ["2024-10-07", "2024-10-14", "2024-10-21"]);
+	assert.equal(dates[dates.length - 1], "2024-12-02");
+
+	// Every other week, and a window long after the start (skip-ahead).
+	const biweekly = { freq: "weekly" as const, interval: 2 };
+	assert.deepEqual(expandOccurrences("2024-10-07", biweekly, [], { from: "2026-01-01", to: "2026-01-31" }),
+		["2026-01-12", "2026-01-26"]);
+	// And a counted one walks from the start.
+	assert.deepEqual(expandOccurrences("2026-02-04", { freq: "weekly", interval: 1, count: 3 }, [], { from: "2026-01-01", to: "2026-12-31" }),
+		["2026-02-04", "2026-02-11", "2026-02-18"]);
 });

@@ -1,4 +1,4 @@
-import { CalendarEvent, isPullOnlySeries, isScheduled } from "../model/types";
+import { CalendarEvent, ProviderKey, SyncBinding, isLocked, isScheduled } from "../model/types";
 import { ParsedVEvent } from "./ics";
 import { CalDavResource } from "./caldav";
 
@@ -18,7 +18,23 @@ export type SyncAction =
 	| { kind: "move-remote"; event: CalendarEvent; from: string; to: string }
 	| { kind: "unlink-local"; event: CalendarEvent };
 
+/** Reads one service's link off an event. */
+export type BindingOf = (event: CalendarEvent) => SyncBinding | undefined;
+
+/** The planner's default service, which is also the one every test uses. */
+const icloudBinding: BindingOf = (event) => event.icloud;
+
+/** The link accessor for a service. */
+export function bindingFor(key: ProviderKey): BindingOf {
+	return (event) => event[key];
+}
+
 export interface PlanInput {
+	/**
+	 * Which service's link to read. Every service shares this planner; only
+	 * the key its bookkeeping lives under differs. Defaults to iCloud.
+	 */
+	binding?: BindingOf;
 	/** Local events already bound to this calendar, plus any unbound ones. */
 	localEvents: CalendarEvent[];
 	/** Every resource the server currently holds, with its ETag. */
@@ -51,32 +67,47 @@ export interface PlanInput {
 	claimedUids?: Set<string>;
 }
 
+/**
+ * Bumped whenever the reader learns to write a kind of series it used to
+ * refuse. Series marked unsupported by an older reader are read again once.
+ *
+ * 1: weekly weekdays, until/count, EXDATE.
+ * 2: positional rules ("the 2nd Tuesday", "the last weekday") and
+ *    per-occurrence overrides.
+ */
+export const RULE_READER_VERSION = 2;
+
+/** The `unsupportedRule` marker for a pulled VEVENT, or undefined if we own it. */
+export function unsupportedMarker(remote: { recurring: boolean; recurrence?: unknown } | null | undefined): number | undefined {
+	return remote && remote.recurring && !remote.recurrence ? RULE_READER_VERSION : undefined;
+}
+
 /** Resources whose ETag differs from what the local copy last saw. */
 export function resourcesNeedingFetch(
 	localEvents: CalendarEvent[],
-	remoteResources: CalDavResource[]
+	remoteResources: CalDavResource[],
+	binding: BindingOf = icloudBinding
 ): string[] {
 	const knownEtags = new Map<string, string>();
 	for (const event of localEvents) {
-		if (event.icloud?.href && event.icloud.etag) {
-			knownEtags.set(event.icloud.href, event.icloud.etag);
-		}
+		const link = binding(event);
+		if (link?.href && link.etag) knownEtags.set(link.href, link.etag);
 	}
 	// A series recorded before the plugin could read rules has no local
 	// `recurrence` block, so its ETag matches and it would never be looked at
 	// again. Fetch it once more to learn its rule; `unsupportedRule` records
 	// the answer when the rule turns out to be one we cannot author, so this
-	// re-reads each such event exactly once rather than every sync.
+	// re-reads each such event once per reader version rather than every sync.
 	const unread = new Set(
 		localEvents
 			.filter(
 				(event) =>
-					event.icloud?.href &&
-					event.icloud.recurring &&
+					binding(event)?.href &&
+					binding(event)?.recurring &&
 					!event.recurrence &&
-					!event.icloud.unsupportedRule
+					binding(event)?.unsupportedRule !== RULE_READER_VERSION
 			)
-			.map((event) => event.icloud!.href as string)
+			.map((event) => binding(event)!.href as string)
 	);
 
 	return remoteResources
@@ -95,12 +126,13 @@ function timestamp(value: string | undefined): number {
 /**
  * Decides, per event, which side wins.
  *
- * Last edit wins: the local `icloud.localModified` stamp is compared against
+ * Last edit wins: the link's `localModified` stamp is compared against
  * the VEVENT's LAST-MODIFIED. A local event that has never been pushed always
  * wins, and a remote event we have never seen is always adopted.
  */
 export function planSync(input: PlanInput): SyncAction[] {
 	const { localEvents, remoteResources, fetched, calendarUrl, routeFor } = input;
+	const binding = input.binding ?? icloudBinding;
 	const knownUids = input.knownUids ?? new Set<string>();
 	const claimedUids = input.claimedUids ?? new Set<string>();
 	const actions: SyncAction[] = [];
@@ -127,13 +159,14 @@ export function planSync(input: PlanInput): SyncAction[] {
 		}
 		handledUids.add(remote.uid);
 
-		const localTime = timestamp(local.icloud?.localModified);
+		const localTime = timestamp(binding(local)?.localModified);
 		const remoteTime = timestamp(remote.remoteModified);
 
 		// A series whose rule we could not read back stays pull-only: the note
 		// cannot express it, so anything we sent would flatten it. A rule we
-		// did parse is an ordinary event as far as conflicts go.
-		if ((remote.recurring && !remote.recurrence) || isPullOnlySeries(local)) {
+		// did parse is an ordinary event as far as conflicts go. A locked
+		// event is pull-only by the user's choice, so the server always wins.
+		if ((remote.recurring && !remote.recurrence) || isLocked(local)) {
 			actions.push({ kind: "update-local", event: local, remote, href, etag });
 		} else if (remoteTime >= localTime) {
 			actions.push({ kind: "update-local", event: local, remote, href, etag });
@@ -145,20 +178,26 @@ export function planSync(input: PlanInput): SyncAction[] {
 	// --- local -> remote ---
 	for (const event of localEvents) {
 		if (handledUids.has(event.uid)) continue;
-		const href = event.icloud?.href;
-		const boundHere = Boolean(href) && event.icloud?.collection === calendarUrl;
+		const link = binding(event);
+		const href = link?.href;
+		const boundHere = Boolean(href) && link?.collection === calendarUrl;
 		const target = routeFor(event);
 
-		// An unbound event is only this calendar's business if it routes here.
+		// Never create, write, move or delete a locked event or a series the
+		// plugin cannot express.
+		if (isLocked(event)) continue;
+
+		// An unbound event is only this calendar's business if it routes here --
+		// and not at all once it was deleted on this service and the user's
+		// deletion setting keeps it out.
 		if (!href) {
+			if (link?.excluded) continue;
 			if (target === calendarUrl && isScheduled(event)) {
 				actions.push({ kind: "create-remote", event });
 			}
 			continue;
 		}
 		if (!boundHere) continue;
-		// Never write, move or delete a series the plugin cannot express.
-		if (isPullOnlySeries(event)) continue;
 
 		// An event that lost its date, or was marked TBD, is no longer a
 		// calendar entry and must come back off the server.
@@ -188,8 +227,8 @@ export function planSync(input: PlanInput): SyncAction[] {
 
 		// Unchanged ETag means the fetch skipped it, so only a local edit
 		// since the last push is worth sending.
-		const pushed = timestamp(event.icloud?.remoteModified);
-		if (timestamp(event.icloud?.localModified) > pushed) {
+		const pushed = timestamp(link?.remoteModified);
+		if (timestamp(link?.localModified) > pushed) {
 			actions.push({ kind: "update-remote", event });
 		}
 	}
@@ -209,7 +248,9 @@ export function mergeRemote(
 	etag: string,
 	calendarUrl: string,
 	/** Merges the calendar's mapped type in without dropping the others. */
-	addTypes: (existing: string[]) => string[] = (existing) => existing
+	addTypes: (existing: string[]) => string[] = (existing) => existing,
+	/** Which service the remote copy came from, i.e. which link to update. */
+	key: ProviderKey = "icloud"
 ): CalendarEvent {
 	return {
 		...event,
@@ -228,16 +269,63 @@ export function mergeRemote(
 		// is deliberate: it is what puts the event back into pull-only.
 		recurrence: remote.recurrence,
 		exceptions: remote.recurrence ? remote.exceptions : undefined,
-		icloud: {
-			...event.icloud,
+		overrides: remote.recurrence ? remote.overrides : undefined,
+		[key]: {
+			...event[key],
+			// Seen on this service again, so no longer kept out of it.
+			excluded: undefined,
 			collection: calendarUrl,
 			href,
 			etag,
 			remoteModified: remote.remoteModified,
 			recurring: remote.recurring || undefined,
-			unsupportedRule: remote.recurring && !remote.recurrence ? true : undefined,
+			unsupportedRule: unsupportedMarker(remote),
 			// The local copy now matches the remote, so it is no longer ahead.
 			localModified: remote.remoteModified,
 		},
+	};
+}
+
+/**
+ * A new note for an event first seen on a service. A pulled event carries no
+ * types of its own unless this plugin wrote it, so the calendar it came from
+ * supplies one.
+ */
+export function newEventFromRemote(
+	remote: ParsedVEvent,
+	key: ProviderKey,
+	href: string,
+	etag: string,
+	calendarId: string,
+	addTypes: (existing: string[]) => string[],
+	timezone: string,
+	uid: string
+): CalendarEvent {
+	return {
+		uid,
+		title: remote.title,
+		types: addTypes(remote.types ?? []),
+		date: remote.date,
+		recurrence: remote.recurrence,
+		exceptions: remote.recurrence ? remote.exceptions : undefined,
+		overrides: remote.recurrence ? remote.overrides : undefined,
+		startTime: remote.startTime,
+		endTime: remote.endTime,
+		allDay: remote.allDay,
+		location: remote.location,
+		description: remote.description,
+		timezone,
+		status: "confirmed",
+		props: remote.props ?? {},
+		[key]: {
+			collection: calendarId,
+			href,
+			etag,
+			remoteModified: remote.remoteModified,
+			localModified: remote.remoteModified,
+			recurring: remote.recurring || undefined,
+			unsupportedRule: unsupportedMarker(remote),
+		},
+		path: "",
 	};
 }

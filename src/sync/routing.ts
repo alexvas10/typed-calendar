@@ -1,8 +1,12 @@
 import { CalendarEvent, EventType } from "../model/types";
 
+/** The EventType field holding a type's calendar on one service. */
+export type CalendarField = "icloudCalendar" | "googleCalendar" | "outlookCalendar";
+
 /**
- * Decides which iCloud calendar an event belongs in, and which event type an
- * incoming iCloud event should be tagged with.
+ * Decides which calendar an event belongs in on one service, and which event
+ * type an incoming event from that service should be tagged with. One router
+ * per service; `field` says which of a type's calendar mappings it reads.
  *
  * The two directions are deliberately asymmetric. Outbound, many types
  * collapse to one collection, chosen by rank. Inbound, one collection
@@ -15,7 +19,8 @@ export class CalendarRouter {
 	constructor(
 		private readonly types: EventType[],
 		/** Where events with no mapped type go. Empty disables their push. */
-		private readonly fallbackCalendar: string
+		private readonly fallbackCalendar: string,
+		private readonly field: CalendarField = "icloudCalendar"
 	) {
 		this.byType = new Map(types.map((type) => [type.id, type]));
 	}
@@ -29,15 +34,15 @@ export class CalendarRouter {
 		let best: EventType | undefined;
 		for (const id of event.types) {
 			const type = this.byType.get(id);
-			if (!type?.icloudCalendar) continue;
+			if (!type?.[this.field]) continue;
 			if (!best || type.rank > best.rank) best = type;
 		}
-		return best?.icloudCalendar ?? (this.fallbackCalendar || undefined);
+		return best?.[this.field] ?? (this.fallbackCalendar || undefined);
 	}
 
 	/** The type id an event pulled from this calendar should carry. */
 	typeForCalendar(calendarUrl: string): string | undefined {
-		return this.types.find((type) => type.icloudCalendar === calendarUrl)?.id;
+		return this.types.find((type) => type[this.field] === calendarUrl)?.id;
 	}
 
 	/** Adds the calendar's type without disturbing types already present. */
@@ -106,14 +111,15 @@ export interface AutoMapResult {
  */
 export function autoMapCalendars(
 	types: EventType[],
-	calendars: { url: string; displayName: string }[]
+	calendars: { url: string; displayName: string }[],
+	field: CalendarField = "icloudCalendar"
 ): AutoMapResult {
 	const next = types.map((type) => ({ ...type }));
 	const mappings: string[] = [];
 	const created: string[] = [];
 
 	const claimed = new Set(
-		next.map((type) => type.icloudCalendar).filter((url): url is string => Boolean(url))
+		next.map((type) => type[field]).filter((url): url is string => Boolean(url))
 	);
 
 	for (const calendar of calendars) {
@@ -125,12 +131,12 @@ export function autoMapCalendars(
 		// If the natural type is already wired to another calendar, fall back
 		// to a type named after this one rather than leaving it unmapped.
 		const claimedSynonym = next.find(
-			(candidate) => candidate.id === synonym && candidate.icloudCalendar
+			(candidate) => candidate.id === synonym && candidate[field]
 		);
 		const targetId = claimedSynonym ? key : synonym;
 
 		let type = next.find((candidate) => candidate.id === targetId);
-		if (type?.icloudCalendar) continue;
+		if (type?.[field]) continue;
 
 		if (!type) {
 			const preset = GENERATED_DEFAULTS[targetId];
@@ -145,7 +151,7 @@ export function autoMapCalendars(
 			created.push(type.label);
 		}
 
-		type.icloudCalendar = calendar.url;
+		type[field] = calendar.url;
 		claimed.add(calendar.url);
 		mappings.push(`${calendar.displayName} → ${type.label}`);
 	}

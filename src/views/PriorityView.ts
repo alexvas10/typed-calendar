@@ -90,7 +90,7 @@ export class PriorityView extends ItemView {
 		});
 
 		const body = item.createDiv({ cls: "tc-row-body" });
-		body.createDiv({ cls: "tc-row-title", text: row.event.title });
+		body.createDiv({ cls: "tc-row-title", text: row.title });
 
 		const meta = body.createDiv({ cls: "tc-row-meta" });
 		for (const id of row.event.types) {
@@ -105,7 +105,7 @@ export class PriorityView extends ItemView {
 		// Pass the occurrence: for a weekly class, the row the user clicked is
 		// the one they may want to cancel.
 		item.addEventListener("click", () =>
-			this.plugin.openEventModal(row.event, undefined, row.date)
+			this.plugin.openEventModal(row.event, undefined, row.occurrence)
 		);
 	}
 }

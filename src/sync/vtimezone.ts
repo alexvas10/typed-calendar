@@ -18,8 +18,26 @@ import { timezoneAbbreviation, utcOffsetMinutes } from "../util/timezone";
  */
 export function buildVTimezone(timezone: string, year: number): ICAL.Component | null {
 	let transitions: Transition[];
+	let rulesChanged = false;
 	try {
 		transitions = findTransitions(timezone, year);
+		// Each observance only applies from its DTSTART onward. Anchored in the
+		// event's own year, the first clock change of that year would leave the
+		// weeks before it undefined -- January in the northern hemisphere,
+		// January to April in the southern -- and a time read back in that gap
+		// comes out hours wrong. Anchoring a year earlier covers the whole year
+		// when the rules are the same both years, which is nearly always.
+		const earlier = findTransitions(timezone, year - 1);
+		const sameRules =
+			earlier.length === transitions.length &&
+			earlier.every(
+				(transition, i) =>
+					transition.rrule === transitions[i].rrule &&
+					transition.from === transitions[i].from &&
+					transition.to === transitions[i].to
+			);
+		if (sameRules) transitions = earlier;
+		else rulesChanged = true;
 	} catch {
 		return null;
 	}
@@ -28,6 +46,8 @@ export function buildVTimezone(timezone: string, year: number): ICAL.Component |
 	const vtimezone = new ICAL.Component("vtimezone");
 	vtimezone.updatePropertyWithValue("tzid", timezone);
 
+	// A zone with no clock changes -- China, India, Japan, most of Africa --
+	// is one offset from 1970 onward, so every date is covered.
 	if (transitions.length === 0) {
 		const instant = Date.UTC(year, 0, 1);
 		const offset = utcOffsetMinutes(instant, timezone);
@@ -41,6 +61,25 @@ export function buildVTimezone(timezone: string, year: number): ICAL.Component |
 			})
 		);
 		return vtimezone;
+	}
+
+	if (rulesChanged) {
+		// The rules changed this year (as in the US in 2007), so the previous
+		// year's changes cannot stand in for this one's. Pin the offset in force
+		// on 1 January instead, which covers the stretch before this year's
+		// first change without claiming anything about earlier years.
+		const instant = Date.UTC(year, 0, 1, 12);
+		const offset = utcOffsetMinutes(instant, timezone);
+		const lowest = Math.min(...transitions.flatMap((t) => [t.from, t.to]));
+		vtimezone.addSubcomponent(
+			standardComponent(offset > lowest ? "daylight" : "standard", {
+				name: timezoneAbbreviation(instant, timezone),
+				from: offset,
+				to: offset,
+				start: { year, month: 1, day: 1, hour: 0, minute: 0 },
+				rrule: null,
+			})
+		);
 	}
 
 	for (const transition of transitions) {

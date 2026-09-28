@@ -1,4 +1,5 @@
 import { EventType } from "../model/types";
+import type { OAuthTokens } from "../sync/oauth";
 import { DEFAULT_EVENT_TYPES } from "../model/defaults";
 
 /** One remote calendar the user has chosen to sync. */
@@ -27,6 +28,37 @@ export interface CalDavSettings {
 	lastSync: string;
 }
 
+/**
+ * A Google or Outlook account. Sign-in uses the user's own app registration
+ * for now (a Google Cloud OAuth client, an Azure app); a built-in one for
+ * everyone is planned -- see handoff.md.
+ */
+export interface OAuthServiceSettings {
+	clientId: string;
+	/** Google only: its desktop clients have a (non-confidential) secret. */
+	clientSecret: string;
+	/**
+	 * Refresh and access tokens. Like the iCloud password these sit in
+	 * plaintext in the vault, because Obsidian does not encrypt plugin data;
+	 * they are revocable from the account's security page.
+	 */
+	tokens: OAuthTokens | null;
+	/** Shown in settings so the user knows which account is connected. */
+	account: string;
+	/** Calendars chosen to sync. `url` holds the service's calendar id. */
+	calendars: SyncedCalendar[];
+	fallbackCalendar: string;
+}
+
+/**
+ * What a deletion made directly in one calendar does.
+ * - "this-calendar": the event leaves that calendar only; the note and the
+ *   other calendars keep it, and it is not sent back there.
+ * - "everywhere": the note and every other copy are deleted too.
+ * Deleting from Obsidian always removes the event everywhere.
+ */
+export type DeleteMode = "this-calendar" | "everywhere";
+
 export interface TypedCalendarSettings {
 	/** Folder scanned for event notes. Notes elsewhere are ignored. */
 	eventFolder: string;
@@ -40,6 +72,9 @@ export interface TypedCalendarSettings {
 	/** Emit schema/docs into the event folder so agents can read them. */
 	writeAgentDocs: boolean;
 	caldav: CalDavSettings;
+	google: OAuthServiceSettings;
+	outlook: OAuthServiceSettings;
+	deleteMode: DeleteMode;
 }
 
 export const DEFAULT_CALDAV: CalDavSettings = {
@@ -52,6 +87,15 @@ export const DEFAULT_CALDAV: CalDavSettings = {
 	lastSync: "",
 };
 
+export const DEFAULT_OAUTH_SERVICE: OAuthServiceSettings = {
+	clientId: "",
+	clientSecret: "",
+	tokens: null,
+	account: "",
+	calendars: [],
+	fallbackCalendar: "",
+};
+
 export const DEFAULT_SETTINGS: TypedCalendarSettings = {
 	eventFolder: "Calendar/Events",
 	eventTypes: DEFAULT_EVENT_TYPES,
@@ -60,6 +104,9 @@ export const DEFAULT_SETTINGS: TypedCalendarSettings = {
 	defaultTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
 	writeAgentDocs: true,
 	caldav: DEFAULT_CALDAV,
+	google: DEFAULT_OAUTH_SERVICE,
+	outlook: DEFAULT_OAUTH_SERVICE,
+	deleteMode: "this-calendar",
 };
 
 /**
@@ -87,6 +134,29 @@ export function normalizeSettings(stored: unknown): TypedCalendarSettings {
 			: DEFAULT_SETTINGS.defaultTimezone,
 		writeAgentDocs: raw.writeAgentDocs !== false,
 		caldav: normalizeCalDav(raw.caldav),
+		google: normalizeOAuthService(raw.google),
+		outlook: normalizeOAuthService(raw.outlook),
+		deleteMode: raw.deleteMode === "everywhere" ? "everywhere" : "this-calendar",
+	};
+}
+
+function normalizeOAuthService(stored: unknown): OAuthServiceSettings {
+	const raw = (stored ?? {}) as Partial<OAuthServiceSettings>;
+	const tokens = raw.tokens;
+	return {
+		clientId: typeof raw.clientId === "string" ? raw.clientId.trim() : "",
+		clientSecret: typeof raw.clientSecret === "string" ? raw.clientSecret.trim() : "",
+		tokens:
+			tokens && typeof tokens.refreshToken === "string" && tokens.refreshToken
+				? {
+						accessToken: typeof tokens.accessToken === "string" ? tokens.accessToken : "",
+						refreshToken: tokens.refreshToken,
+						expiresAt: typeof tokens.expiresAt === "number" ? tokens.expiresAt : 0,
+					}
+				: null,
+		account: typeof raw.account === "string" ? raw.account : "",
+		calendars: Array.isArray(raw.calendars) ? raw.calendars : [],
+		fallbackCalendar: typeof raw.fallbackCalendar === "string" ? raw.fallbackCalendar : "",
 	};
 }
 
@@ -129,4 +199,3 @@ export function uniqueTypeId(label: string, existing: EventType[]): string {
 	}
 	throw new Error(`Could not find a free id for "${label}".`);
 }
-

@@ -90,3 +90,24 @@ test("an unrecognised calendar name becomes its own type", () => {
 	assert.equal(mapped[0].label, "Rowing Club");
 	assert.deepEqual(created, ["Rowing Club"]);
 });
+
+test("each service routes by its own mapping, and one service's mapping never leaks into another", () => {
+	const types = [
+		{ id: "exam", label: "Exam", color: "#c00", rank: 30, fields: [], icloudCalendar: "icloud-evals", googleCalendar: "g-exams" },
+		{ id: "personal", label: "Personal", color: "#0c0", rank: 10, fields: [], outlookCalendar: "o-home" },
+	];
+	const event = { uid: "u", title: "t", types: ["exam", "personal"], allDay: true, status: "confirmed" as const, props: {}, path: "" };
+	assert.equal(new CalendarRouter(types, "").routeFor(event), "icloud-evals");
+	assert.equal(new CalendarRouter(types, "", "googleCalendar").routeFor(event), "g-exams");
+	assert.equal(new CalendarRouter(types, "", "outlookCalendar").routeFor(event), "o-home",
+		"Exam outranks Personal, but Exam has no Outlook calendar, so Personal's is used");
+	assert.equal(new CalendarRouter(types, "", "googleCalendar").typeForCalendar("icloud-evals"), undefined);
+});
+
+test("discovery maps a service's calendars without touching another service's mapping", () => {
+	const types = [{ id: "exam", label: "Exam", color: "#c00", rank: 30, fields: [], icloudCalendar: "icloud-evals" }];
+	const result = autoMapCalendars(types, [{ url: "g-exams", displayName: "Exams" }], "googleCalendar");
+	const exam = result.types.find((t) => t.id === "exam")!;
+	assert.equal(exam.googleCalendar, "g-exams");
+	assert.equal(exam.icloudCalendar, "icloud-evals");
+});

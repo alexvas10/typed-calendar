@@ -1,4 +1,13 @@
-import { Frequency, RecurrenceRule, WEEKDAYS, Weekday } from "../model/recurrence";
+import {
+	Frequency,
+	NthWeekday,
+	RecurrenceRule,
+	Weekday,
+	canonicalRule,
+	formatDayEntry,
+	parseDayEntry,
+	ruleProblem,
+} from "../model/recurrence";
 import { utcToWallClock, toWallClock, wallClockToUtc } from "../util/timezone";
 
 /**
@@ -18,7 +27,24 @@ const FREQUENCIES: Record<string, Frequency> = {
 };
 
 /** Parts we understand. Anything else present means we do not own the rule. */
-const KNOWN_PARTS = new Set(["FREQ", "INTERVAL", "BYDAY", "UNTIL", "COUNT", "WKST"]);
+const KNOWN_PARTS = new Set([
+	"FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "BYSETPOS", "UNTIL", "COUNT", "WKST",
+]);
+
+/**
+ * A comma list of non-zero integers within +/-limit. Null when any entry is
+ * out of range: a part we cannot represent exactly is a part we do not own.
+ */
+function integerList(value: string, limit: number, allowNegative: boolean): number[] | null {
+	const out: number[] = [];
+	for (const entry of value.split(",")) {
+		const n = Number(entry.trim());
+		if (!Number.isInteger(n) || n === 0 || Math.abs(n) > limit) return null;
+		if (n < 0 && !allowNegative) return null;
+		out.push(n);
+	}
+	return out.length > 0 ? out : null;
+}
 
 export function parseRRule(rrule: string, timezone: string): RecurrenceRule | null {
 	const parts = new Map<string, string>();
@@ -43,19 +69,37 @@ export function parseRRule(rrule: string, timezone: string): RecurrenceRule | nu
 
 	const byDay = parts.get("BYDAY");
 	if (byDay) {
-		// BYDAY only means "these weekdays" on a weekly rule. On a monthly one
-		// it positions ("the second Tuesday"), which this subset cannot honour.
-		if (freq !== "weekly") return null;
-		const days: Weekday[] = [];
+		const plain: Weekday[] = [];
+		const nth: NthWeekday[] = [];
 		for (const entry of byDay.split(",")) {
-			const code = entry.trim().toUpperCase();
-			// A numeric prefix (-1FR, 2TU) is positional; not ours either.
-			if (!(WEEKDAYS as readonly string[]).includes(code)) return null;
-			days.push(code as Weekday);
+			const parsed = parseDayEntry(entry);
+			if (!parsed) return null;
+			if (typeof parsed === "string") plain.push(parsed);
+			else nth.push(parsed);
 		}
-		if (days.length === 0) return null;
-		rule.byDay = WEEKDAYS.filter((day) => days.includes(day));
+		// A position ("2TU") only means something within a month.
+		if (nth.length > 0 && freq !== "monthly" && freq !== "yearly") return null;
+		if (plain.length > 0) rule.byDay = plain;
+		if (nth.length > 0) rule.byNthDay = nth;
 	}
+
+	const lists: Array<[string, keyof RecurrenceRule, number, boolean]> = [
+		["BYMONTHDAY", "byMonthDay", 31, true],
+		["BYMONTH", "byMonth", 12, false],
+		// A yearly rule over several months could in principle position past
+		// the 31st. Nothing Apple's editor writes does, and refusing is the
+		// safe side of that line.
+		["BYSETPOS", "bySetPos", 31, true],
+	];
+	for (const [part, key, limit, allowNegative] of lists) {
+		const value = parts.get(part);
+		if (value === undefined) continue;
+		const parsed = integerList(value, limit, allowNegative);
+		if (!parsed) return null;
+		(rule as unknown as Record<string, number[]>)[key] = parsed;
+	}
+
+	if (ruleProblem(rule)) return null;
 
 	// WKST decides where an interval-skipped week begins, so it only changes
 	// the result for a multi-week rule. Expansion anchors on Sunday.
@@ -76,7 +120,7 @@ export function parseRRule(rrule: string, timezone: string): RecurrenceRule | nu
 		rule.count = parsed;
 	}
 
-	return rule;
+	return canonicalRule(rule);
 }
 
 /**
@@ -106,7 +150,11 @@ function untilToLocalDate(until: string, timezone: string): string | null {
 export function formatRRule(rule: RecurrenceRule, timezone: string, allDay: boolean): string {
 	const parts = [`FREQ=${rule.freq.toUpperCase()}`];
 	if (rule.interval > 1) parts.push(`INTERVAL=${rule.interval}`);
-	if (rule.byDay?.length) parts.push(`BYDAY=${rule.byDay.join(",")}`);
+	if (rule.byMonth?.length) parts.push(`BYMONTH=${rule.byMonth.join(",")}`);
+	if (rule.byMonthDay?.length) parts.push(`BYMONTHDAY=${rule.byMonthDay.join(",")}`);
+	const days = [...(rule.byDay ?? []), ...(rule.byNthDay ?? []).map(formatDayEntry)];
+	if (days.length > 0) parts.push(`BYDAY=${days.join(",")}`);
+	if (rule.bySetPos?.length) parts.push(`BYSETPOS=${rule.bySetPos.join(",")}`);
 	if (rule.until) parts.push(`UNTIL=${formatUntil(rule.until, timezone, allDay)}`);
 	else if (rule.count) parts.push(`COUNT=${rule.count}`);
 	return parts.join(";");
@@ -128,5 +176,8 @@ export function sameRule(
 	allDay: boolean
 ): boolean {
 	if (!a || !b) return !a && !b;
-	return formatRRule(a, timezone, allDay) === formatRRule(b, timezone, allDay);
+	return (
+		formatRRule(canonicalRule(a), timezone, allDay) ===
+		formatRRule(canonicalRule(b), timezone, allDay)
+	);
 }

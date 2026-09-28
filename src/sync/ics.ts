@@ -1,7 +1,8 @@
 import ICAL from "ical.js";
-import { CalendarEvent } from "../model/types";
+import { CalendarEvent, OccurrenceOverride } from "../model/types";
 import { RecurrenceRule } from "../model/recurrence";
-import { toWallClock, utcToWallClock, wallClockToUtc } from "../util/timezone";
+import { Occurrence, activeOverrides, applyOverride, isOccurrenceOf } from "../model/occurrences";
+import { isValidTimezone, toWallClock, utcToWallClock, wallClockToUtc } from "../util/timezone";
 import { addDays } from "../util/dates";
 import { formatRRule, parseRRule, sameRule } from "./rrule";
 import { buildVTimezone } from "./vtimezone";
@@ -34,6 +35,11 @@ export interface ParsedVEvent {
 	recurrence?: RecurrenceRule;
 	/** Dates excluded from the series (EXDATE), as local dates. */
 	exceptions?: string[];
+	/**
+	 * Occurrences the server holds as separate RECURRENCE-ID components, each
+	 * reduced to what differs from the series.
+	 */
+	overrides?: OccurrenceOverride[];
 }
 
 /**
@@ -97,6 +103,7 @@ export function eventToICS(event: CalendarEvent, fallbackTimezone: string): stri
 			ICAL.Recur.fromString(formatRRule(event.recurrence, timezone, allDay))
 		);
 		applyExceptions(vevent, event.exceptions ?? [], timezone);
+		reconcileOverrides(calendar, vevent, event, timezone, false);
 	}
 
 	// Best-effort mirror of the vault-only data. iCloud may drop unknown X-
@@ -116,56 +123,109 @@ export function eventToICS(event: CalendarEvent, fallbackTimezone: string): stri
 }
 
 /**
- * Rewrites the EXDATE properties to exactly the given dates.
+ * The value that names one occurrence of a series, for an EXDATE or a
+ * RECURRENCE-ID.
  *
- * Each exclusion is built by cloning DTSTART and moving its date, so it keeps
- * the series' value type and TZID. An EXDATE that does not match DTSTART's
- * form is within its rights to be ignored by the server, and a silently
- * ignored exclusion means a cancelled class quietly reappears.
+ * Built by cloning DTSTART and moving its date, so it keeps the series' value
+ * type and TZID. A reference that does not match DTSTART's form is within the
+ * server's rights to ignore, and a silently ignored one means a cancelled
+ * class quietly reappears or a moved one appears twice.
  */
-function applyExceptions(vevent: ICAL.Component, dates: string[], timezone: string): void {
-	vevent.removeAllProperties("exdate");
-	if (dates.length === 0) return;
-
-	const dtstart = vevent.getFirstProperty("dtstart");
+function occurrenceValue(
+	master: ICAL.Component,
+	date: string,
+	timezone: string
+): { time: ICAL.Time; tzid?: string } {
+	const dtstart = master.getFirstProperty("dtstart");
 	const base = dtstart?.getFirstValue() as ICAL.Time | undefined;
-	const tzid = dtstart?.getParameter("tzid");
+	const tzid = (dtstart?.getParameter("tzid") as string | undefined) ?? undefined;
 	// The occurrence's time of day, read in the event's own zone. Taking it
 	// from DTSTART rather than from the note keeps the two in step even when
 	// the note and the server disagree about the hour.
 	const startTime =
-		base && !base.isDate
-			? utcToWallClock(base.toJSDate().valueOf(), timezone).time
+		dtstart && base && !base.isDate
+			? utcToWallClock(instantOf(dtstart, base, timezone), timezone).time
 			: undefined;
 
-	for (const date of [...dates].sort()) {
-		const [year, month, day] = date.split("-").map(Number);
-		let time: ICAL.Time;
-		if (base && startTime && base.zone?.tzid === "UTC") {
-			// DTSTART is a UTC instant, so its calendar date is not necessarily
-			// the local one: moving the date on a clone would land the
-			// exclusion a day out. Convert the local occurrence instead.
-			const wall = toWallClock(date, startTime);
-			time = wall
-				? ICAL.Time.fromJSDate(new Date(wallClockToUtc(wall, timezone)), true)
-				: base.clone();
-		} else if (base) {
-			// A TZID-qualified or floating DTSTART already reads as wall-clock
-			// time, so moving the date keeps the hour -- and keeps it across a
-			// daylight-saving boundary, which an instant would not.
-			time = base.clone();
-			time.year = year;
-			time.month = month;
-			time.day = day;
-		} else {
-			time = ICAL.Time.fromData({ year, month, day, isDate: true });
-		}
-		const property = new ICAL.Property("exdate");
-		if (time.isDate) property.resetType("date");
-		property.setValue(time);
-		if (tzid && !time.isDate) property.setParameter("tzid", tzid as string);
-		vevent.addProperty(property);
+	const [year, month, day] = date.split("-").map(Number);
+	let time: ICAL.Time;
+	if (base && startTime && base.zone?.tzid === "UTC") {
+		// DTSTART is a UTC instant, so its calendar date is not necessarily
+		// the local one: moving the date on a clone would land the reference
+		// a day out. Convert the local occurrence instead.
+		const wall = toWallClock(date, startTime);
+		time = wall
+			? ICAL.Time.fromJSDate(new Date(wallClockToUtc(wall, timezone)), true)
+			: base.clone();
+	} else if (base) {
+		// A TZID-qualified or floating DTSTART already reads as wall-clock
+		// time, so moving the date keeps the hour -- and keeps it across a
+		// daylight-saving boundary, which an instant would not.
+		time = base.clone();
+		time.year = year;
+		time.month = month;
+		time.day = day;
+	} else {
+		time = ICAL.Time.fromData({ year, month, day, isDate: true });
 	}
+	return { time, tzid: time.isDate ? undefined : tzid };
+}
+
+function occurrenceProperty(
+	name: string,
+	master: ICAL.Component,
+	date: string,
+	timezone: string
+): ICAL.Property {
+	const { time, tzid } = occurrenceValue(master, date, timezone);
+	const property = new ICAL.Property(name);
+	if (time.isDate) property.resetType("date");
+	property.setValue(time);
+	if (tzid) property.setParameter("tzid", tzid);
+	return property;
+}
+
+/** Rewrites the EXDATE properties to exactly the given dates. */
+function applyExceptions(vevent: ICAL.Component, dates: string[], timezone: string): void {
+	vevent.removeAllProperties("exdate");
+	for (const date of [...dates].sort()) {
+		vevent.addProperty(occurrenceProperty("exdate", vevent, date, timezone));
+	}
+}
+
+/**
+ * The UTC instant a date-time property value names.
+ *
+ * ical.js resolves a TZID through one process-wide registry in which the
+ * first definition registered wins. A definition this plugin wrote only
+ * describes the years around the event it came with, so once one is
+ * registered, every other time in that zone -- a course from two years ago --
+ * is read against it and comes out hours wrong. An IANA TZID is therefore
+ * converted here, with Intl's own tz database, and only a zone Intl does not
+ * know (an Outlook "Eastern Standard Time") is left to ical.js and the
+ * VTIMEZONE the server sent with it.
+ *
+ * A floating time, with neither TZID nor Z, is wall-clock time in the event's
+ * zone, which is how this plugin writes one.
+ */
+function instantOf(property: ICAL.Property, value: ICAL.Time, timezone: string): number {
+	const utc = value.zone?.tzid === "UTC";
+	if (!utc) {
+		const tzid = property.getParameter("tzid");
+		const zone = typeof tzid === "string" ? tzid : tzid ? undefined : timezone;
+		if (zone && isValidTimezone(zone)) {
+			const wall = { year: value.year, month: value.month, day: value.day, hour: value.hour, minute: value.minute };
+			return wallClockToUtc(wall, zone) + value.second * 1000;
+		}
+	}
+	return value.toJSDate().valueOf();
+}
+
+/** The local calendar date an EXDATE or RECURRENCE-ID value refers to. */
+function localDateOf(property: ICAL.Property, value: ICAL.Time, timezone: string): string {
+	return value.isDate
+		? value.toString().slice(0, 10)
+		: utcToWallClock(instantOf(property, value, timezone), timezone).date;
 }
 
 /** Every EXDATE on the component, as local calendar dates. */
@@ -173,12 +233,7 @@ function readExceptions(vevent: ICAL.Component, timezone: string): string[] {
 	const dates = new Set<string>();
 	for (const property of vevent.getAllProperties("exdate")) {
 		for (const value of property.getValues() as ICAL.Time[]) {
-			if (!value) continue;
-			dates.add(
-				value.isDate
-					? value.toString().slice(0, 10)
-					: utcToWallClock(value.toJSDate().valueOf(), timezone).date
-			);
+			if (value) dates.add(localDateOf(property, value, timezone));
 		}
 	}
 	return Array.from(dates).sort();
@@ -277,16 +332,112 @@ function utcValue(date: string, time: string, timezone: string): ICAL.Time {
 	return ICAL.Time.fromJSDate(new Date(wallClockToUtc(wall, timezone)), true);
 }
 
+/** The fields this plugin models, as one VEVENT states them. */
+interface ComponentFields {
+	date: string;
+	allDay: boolean;
+	startTime?: string;
+	endTime?: string;
+	title?: string;
+	location?: string;
+	description?: string;
+}
+
+/** Reads a VEVENT's own fields. Null when it has no usable DTSTART. */
+function readFields(vevent: ICAL.Component, timezone: string): ComponentFields | null {
+	const startProperty = vevent.getFirstProperty("dtstart");
+	const start = startProperty?.getFirstValue() as ICAL.Time | undefined;
+	if (!startProperty || !start) return null;
+
+	const fields: ComponentFields = { date: "", allDay: Boolean(start.isDate) };
+	if (fields.allDay) {
+		fields.date = start.toString().slice(0, 10);
+	} else {
+		const startLocal = utcToWallClock(instantOf(startProperty, start, timezone), timezone);
+		fields.date = startLocal.date;
+		fields.startTime = startLocal.time;
+
+		const endProperty = vevent.getFirstProperty("dtend");
+		const endValue = endProperty?.getFirstValue() as ICAL.Time | undefined;
+		if (endProperty && endValue) {
+			fields.endTime = utcToWallClock(instantOf(endProperty, endValue, timezone), timezone).time;
+		}
+	}
+
+	for (const [key, name] of [
+		["title", "summary"],
+		["location", "location"],
+		["description", "description"],
+	] as const) {
+		const value = vevent.getFirstPropertyValue(name);
+		if (value) fields[key] = String(value);
+	}
+	return fields;
+}
+
+/**
+ * Reads a RECURRENCE-ID component as an override: only what differs from the
+ * series is kept, so an occurrence moved to another room says just that.
+ *
+ * An override that changes nothing this plugin models -- only its alarm, say
+ * -- still comes back as a bare `{ occurrence }`. Dropping it would make the
+ * next push delete the component and the change the user made in Apple
+ * Calendar along with it.
+ *
+ * Null for the forms that cannot be expressed: RANGE=THISANDFUTURE, which
+ * rewrites every later occurrence, and a cancelled instance, which Apple
+ * never writes and other clients mean as an exclusion.
+ */
+function readOverride(
+	component: ICAL.Component,
+	series: ComponentFields,
+	timezone: string
+): OccurrenceOverride | null {
+	const recurrenceId = component.getFirstProperty("recurrence-id");
+	if (!recurrenceId || recurrenceId.getParameter("range")) return null;
+	if (String(component.getFirstPropertyValue("status") ?? "").toUpperCase() === "CANCELLED") {
+		return null;
+	}
+	const fields = readFields(component, timezone);
+	if (!fields) return null;
+
+	const occurrence = localDateOf(recurrenceId, recurrenceId.getFirstValue() as ICAL.Time, timezone);
+	const override: OccurrenceOverride = { occurrence };
+	if (fields.date !== occurrence) override.date = fields.date;
+	if (fields.allDay !== series.allDay) override.allDay = fields.allDay;
+	if (!fields.allDay) {
+		if (series.allDay || fields.startTime !== series.startTime) {
+			override.startTime = fields.startTime;
+		}
+		if (fields.endTime && (series.allDay || fields.endTime !== series.endTime)) {
+			override.endTime = fields.endTime;
+		}
+	}
+	for (const key of ["title", "location", "description"] as const) {
+		const value = fields[key];
+		if (value && value.trim() !== (series[key] ?? "").trim()) override[key] = value;
+	}
+	return override;
+}
+
+/** A bare event, for asking the recurrence model about a server's series. */
+const EMPTY_EVENT: CalendarEvent = {
+	uid: "",
+	title: "",
+	types: [],
+	allDay: false,
+	status: "confirmed",
+	props: {},
+	path: "",
+};
+
 /**
  * Reads the first VEVENT out of an iCalendar document. Returns null when the
  * body is not parseable, so one malformed resource cannot fail a whole sync.
  */
 export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 	let vevent: ICAL.Component | null = null;
-	// Per-occurrence overrides ("this Tuesday only, in a different room") are
-	// something the plugin can display but not express, so their presence
-	// alone makes the series one we refuse to write.
-	let hasOverrides = false;
+	let instances: ICAL.Component[] = [];
 	try {
 		const calendar = new ICAL.Component(ICAL.parse(ics));
 		// Without this a TZID-qualified time resolves as floating and is read
@@ -301,13 +452,11 @@ export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 		// Recurrence overrides share a UID with their series; the master is the
 		// one without a RECURRENCE-ID.
 		const candidates = calendar.getAllSubcomponents("vevent");
-		hasOverrides = candidates.some((component) =>
-			Boolean(component.getFirstPropertyValue("recurrence-id"))
+		const master = candidates.find(
+			(component) => !component.getFirstPropertyValue("recurrence-id")
 		);
-		vevent =
-			candidates.find((component) => !component.getFirstPropertyValue("recurrence-id")) ??
-			candidates[0] ??
-			null;
+		vevent = master ?? candidates[0] ?? null;
+		if (master) instances = candidates.filter((component) => component !== master);
 	} catch (error) {
 		console.warn("Typed Calendar: could not parse iCalendar body", error);
 		return null;
@@ -317,10 +466,8 @@ export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 	const uid = String(vevent.getFirstPropertyValue("uid") ?? "");
 	if (!uid) return null;
 
-	const dtstart = vevent.getFirstProperty("dtstart");
-	if (!dtstart) return null;
-	const start = dtstart.getFirstValue() as ICAL.Time;
-	const allDay = Boolean(start.isDate);
+	const fields = readFields(vevent, timezone);
+	if (!fields) return null;
 
 	const rrule = vevent.getFirstPropertyValue("rrule");
 	// RDATE adds dates the rule does not describe, so a rule read on its own
@@ -330,39 +477,54 @@ export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 
 	const parsed: ParsedVEvent = {
 		uid,
-		title: String(vevent.getFirstPropertyValue("summary") ?? "Untitled"),
-		allDay,
+		title: fields.title ?? "Untitled",
+		allDay: fields.allDay,
+		date: fields.date,
 		recurring: Boolean(rrule) || hasRdate,
 	};
+	if (!fields.allDay) {
+		parsed.startTime = fields.startTime;
+		if (fields.endTime) parsed.endTime = fields.endTime;
+	}
+	if (fields.location) parsed.location = fields.location;
+	if (fields.description) parsed.description = fields.description;
 
-	if (rrule && !hasRdate && !manyRules && !hasOverrides) {
+	if (rrule && !hasRdate && !manyRules) {
 		const rule = parseRRule(String(rrule), timezone);
-		// A rule outside the writable subset leaves `recurrence` unset, which
-		// is the signal every later stage reads as "pull-only".
-		if (rule) {
+		const overrides: OccurrenceOverride[] = [];
+		let readable = Boolean(rule);
+		for (const instance of rule ? instances : []) {
+			if (String(instance.getFirstPropertyValue("uid") ?? "") !== uid) continue;
+			const override = readOverride(instance, fields, timezone);
+			// An override naming a date this plugin's expansion does not
+			// produce means the two disagree about the series itself. Owning
+			// it would mean deleting or misplacing that override on the next
+			// write, so the whole series stays pull-only instead.
+			const known =
+				override &&
+				rule &&
+				isOccurrenceOf(
+					{ ...EMPTY_EVENT, uid, date: fields.date, recurrence: rule },
+					override.occurrence
+				);
+			if (!override || !known) {
+				readable = false;
+				break;
+			}
+			overrides.push(override);
+		}
+		// A rule or an override outside the writable subset leaves
+		// `recurrence` unset, which is the signal every later stage reads as
+		// "pull-only".
+		if (rule && readable) {
 			parsed.recurrence = rule;
 			const exceptions = readExceptions(vevent, timezone);
 			if (exceptions.length > 0) parsed.exceptions = exceptions;
+			if (overrides.length > 0) {
+				parsed.overrides = overrides.sort((a, b) => a.occurrence.localeCompare(b.occurrence));
+			}
 		}
 	}
-
-	if (allDay) {
-		parsed.date = start.toString().slice(0, 10);
-	} else {
-		const startLocal = utcToWallClock(start.toJSDate().valueOf(), timezone);
-		parsed.date = startLocal.date;
-		parsed.startTime = startLocal.time;
-
-		const endValue = vevent.getFirstProperty("dtend")?.getFirstValue() as ICAL.Time | undefined;
-		if (endValue) {
-			parsed.endTime = utcToWallClock(endValue.toJSDate().valueOf(), timezone).time;
-		}
-	}
-
-	const location = vevent.getFirstPropertyValue("location");
-	if (location) parsed.location = String(location);
-	const description = vevent.getFirstPropertyValue("description");
-	if (description) parsed.description = String(description);
 
 	const lastModified = vevent.getFirstProperty("last-modified")?.getFirstValue() as
 		| ICAL.Time
@@ -391,6 +553,137 @@ export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 	return parsed;
 }
 
+/**
+ * Sets a text property only when its value differs, and reports whether it
+ * did. Notes store text trimmed, while Apple often keeps a trailing space or
+ * newline; comparing them raw would "edit" events nobody touched.
+ */
+function setText(component: ICAL.Component, name: string, value: string | undefined): boolean {
+	const existing = component.getFirstPropertyValue(name);
+	const before = existing === null || existing === undefined ? "" : String(existing);
+	if (before.trim() === (value ?? "").trim()) return false;
+	if (value) component.updatePropertyWithValue(name, value);
+	else component.removeProperty(name);
+	return true;
+}
+
+function touch(component: ICAL.Component): void {
+	const stamp = ICAL.Time.fromJSDate(new Date(), true);
+	component.updatePropertyWithValue("dtstamp", stamp);
+	component.updatePropertyWithValue("last-modified", stamp);
+}
+
+/** The event as one occurrence would be written: its own date, no rule. */
+function asInstance(event: CalendarEvent, instance: Occurrence): CalendarEvent {
+	return {
+		...event,
+		date: instance.date,
+		allDay: instance.allDay,
+		startTime: instance.startTime,
+		endTime: instance.endTime,
+		recurrence: undefined,
+	};
+}
+
+function sameFields(fields: ComponentFields | null, instance: Occurrence): boolean {
+	if (!fields) return false;
+	if (fields.date !== instance.date || fields.allDay !== instance.allDay) return false;
+	if (instance.allDay) return true;
+	return (
+		fields.startTime === instance.startTime &&
+		(instance.endTime === undefined || fields.endTime === instance.endTime)
+	);
+}
+
+/**
+ * Makes the RECURRENCE-ID components match the event's overrides, and
+ * reports whether anything changed.
+ *
+ * Components are edited in place like the master is, so an alarm or an
+ * attendee on one occurrence survives an edit to its room. One the note no
+ * longer lists at all -- the user reset it to the series -- is removed. One
+ * the note lists but that no longer applies (skipped, or the rule moved off
+ * its date) is left exactly as the server has it: removing a server-side
+ * change should take a deliberate reset, never a side effect. A new one
+ * copies the series' alarms, which is what Apple does when it detaches an
+ * occurrence; without them a moved class would silently lose its reminder.
+ *
+ * `retime` rebuilds every RECURRENCE-ID after the series' start moved: the
+ * reference names the original start instant, so one left at the old time
+ * would match no occurrence and the change would quietly stop applying.
+ */
+function reconcileOverrides(
+	calendar: ICAL.Component,
+	master: ICAL.Component,
+	event: CalendarEvent,
+	timezone: string,
+	retime: boolean
+): boolean {
+	const wanted = new Map(activeOverrides(event).map((override) => [override.occurrence, override]));
+	const listed = new Set((event.overrides ?? []).map((override) => override.occurrence));
+	let changed = false;
+
+	for (const component of calendar.getAllSubcomponents("vevent")) {
+		const recurrenceId = component.getFirstProperty("recurrence-id");
+		if (component === master || !recurrenceId) continue;
+		const occurrence = localDateOf(
+			recurrenceId,
+			recurrenceId.getFirstValue() as ICAL.Time,
+			timezone
+		);
+		const override = wanted.get(occurrence);
+		if (!override) {
+			if (listed.has(occurrence)) continue;
+			calendar.removeSubcomponent(component);
+			changed = true;
+			continue;
+		}
+		wanted.delete(occurrence);
+
+		let edited = false;
+		if (retime) {
+			component.removeAllProperties("recurrence-id");
+			component.addProperty(occurrenceProperty("recurrence-id", master, occurrence, timezone));
+			edited = true;
+		}
+		const instance = applyOverride(event, occurrence, override);
+		if (!sameFields(readFields(component, timezone), instance)) {
+			setTiming(calendar, component, asInstance(event, instance), timezone);
+			edited = true;
+		}
+		if (setText(component, "summary", instance.title)) edited = true;
+		if (setText(component, "location", instance.location)) edited = true;
+		if (setText(component, "description", instance.description)) edited = true;
+		if (edited) {
+			touch(component);
+			changed = true;
+		}
+	}
+
+	for (const override of wanted.values()) {
+		const instance = applyOverride(event, override.occurrence, override);
+		const component = new ICAL.Component("vevent");
+		component.updatePropertyWithValue("uid", event.uid);
+		component.addProperty(occurrenceProperty("recurrence-id", master, override.occurrence, timezone));
+		setTiming(calendar, component, asInstance(event, instance), timezone);
+		setText(component, "summary", instance.title);
+		setText(component, "location", instance.location);
+		setText(component, "description", instance.description);
+		for (const alarm of master.getAllSubcomponents("valarm")) {
+			const copy = new ICAL.Component(JSON.parse(JSON.stringify(alarm.toJSON())));
+			// An alarm's own identifiers must stay unique; the server issues
+			// fresh ones for the copy.
+			copy.removeAllProperties("uid");
+			copy.removeAllProperties("x-wr-alarmuid");
+			component.addSubcomponent(copy);
+		}
+		touch(component);
+		calendar.addSubcomponent(component);
+		changed = true;
+	}
+	return changed;
+}
+
 export interface PatchResult {
 	ics: string;
 	/** False when the server copy already matches, so no write is needed. */
@@ -415,8 +708,9 @@ export interface PatchResult {
  * actually differs, so an edit to the title leaves every alarm intact and a
  * no-op yields changed=false and no write at all.
  *
- * Recurring events are returned untouched. The note holds one occurrence, so
- * pushing it back would flatten the series; they are pull-only.
+ * A series is patched the same way, rule, exclusions and per-occurrence
+ * components included -- unless the server's copy repeats in a way the note
+ * cannot express, in which case it is returned untouched as pull-only.
  *
  * Returns null when the body cannot be parsed. Callers must refuse to write
  * rather than fall back to eventToICS.
@@ -443,33 +737,35 @@ export function patchICS(
 	if (current.recurrence && !event.recurrence) {
 		return { ics: original, changed: false, recurring: true, pullOnly: true };
 	}
+	// Locked by the user. The planner already skips it; this is the second,
+	// independent guard, so no caller can write one by accident.
+	if (event.readOnly) {
+		return { ics: original, changed: false, recurring: current.recurring, pullOnly: true };
+	}
 	if (!event.date) return null;
 
 	let calendar: ICAL.Component;
 	let vevent: ICAL.Component | undefined;
 	try {
 		calendar = new ICAL.Component(ICAL.parse(original));
-		vevent = calendar.getAllSubcomponents("vevent")[0];
+		// The master, not merely the first VEVENT: an override component may
+		// come first, and editing it as the series would rewrite one date.
+		vevent = calendar
+			.getAllSubcomponents("vevent")
+			.find((component) => !component.getFirstPropertyValue("recurrence-id"));
 	} catch {
 		return null;
 	}
 	if (!vevent) return null;
 
 	let changed = false;
-	const setText = (name: string, value: string | undefined) => {
-		const existing = vevent!.getFirstPropertyValue(name);
-		const before = existing === null || existing === undefined ? "" : String(existing);
-		// Notes store text trimmed, while Apple often keeps a trailing space or
-		// newline. Comparing them raw would "edit" events nobody touched.
-		if (before.trim() === (value ?? "").trim()) return;
-		changed = true;
-		if (value) vevent!.updatePropertyWithValue(name, value);
-		else vevent!.removeProperty(name);
-	};
-
-	setText("summary", event.title);
-	setText("location", event.location);
-	setText("description", event.description);
+	for (const [name, value] of [
+		["summary", event.title],
+		["location", event.location],
+		["description", event.description],
+	] as const) {
+		if (setText(vevent, name, value)) changed = true;
+	}
 
 	const timed = !event.allDay && Boolean(event.startTime);
 	const sameTiming =
@@ -505,6 +801,7 @@ export function patchICS(
 		// rebuilding them even when the set itself is the same: a stale one
 		// lines up with no occurrence and silently excludes nothing.
 		if (differ || !sameTiming) applyExceptions(vevent, wanted, timezone);
+		if (reconcileOverrides(calendar, vevent, event, timezone, !sameTiming)) changed = true;
 	}
 
 	// The X- mirror is best effort and additive: only ever written when the
@@ -523,9 +820,7 @@ export function patchICS(
 		return { ics: original, changed: false, recurring: Boolean(event.recurrence), pullOnly: false };
 	}
 
-	const stamp = ICAL.Time.fromJSDate(new Date(), true);
-	vevent.updatePropertyWithValue("dtstamp", stamp);
-	vevent.updatePropertyWithValue("last-modified", stamp);
+	touch(vevent);
 	return {
 		ics: calendar.toString(),
 		changed: true,

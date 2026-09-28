@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { planSync, mergeRemote, resourcesNeedingFetch, type SyncAction } from "../src/sync/plan";
+import {
+	planSync, mergeRemote, resourcesNeedingFetch, RULE_READER_VERSION, bindingFor, type SyncAction,
+} from "../src/sync/plan";
 import type { CalendarEvent } from "../src/model/types";
 import type { ParsedVEvent } from "../src/sync/ics";
 
@@ -274,8 +276,34 @@ test("a series recorded before rules were read is re-fetched exactly once", () =
 	assert.deepEqual(resourcesNeedingFetch([answered], [{ href: HREF, etag: '"v1"' }]), []);
 
 	const unsupported = bound();
-	unsupported.icloud = { ...unsupported.icloud, recurring: true, unsupportedRule: true };
+	unsupported.icloud = {
+		...unsupported.icloud, recurring: true, unsupportedRule: RULE_READER_VERSION,
+	};
 	assert.deepEqual(resourcesNeedingFetch([unsupported], [{ href: HREF, etag: '"v1"' }]), []);
+});
+
+test("a series an older reader gave up on is read again by a newer one", () => {
+	// `true` is the marker written before reader versions existed, when a
+	// "second Tuesday" or a moved occurrence was beyond the plugin. It may
+	// well be writable now, so it gets one more look.
+	const stale = bound();
+	stale.icloud = { ...stale.icloud, recurring: true, unsupportedRule: true };
+	assert.deepEqual(resourcesNeedingFetch([stale], [{ href: HREF, etag: '"v1"' }]), [HREF]);
+});
+
+test("a pull adopts the server's overrides along with its rule", () => {
+	const moved = { occurrence: "2026-10-21", date: "2026-10-22", location: "DC 1350" };
+	const merged = mergeRemote(
+		bound(), remote({ recurring: true, recurrence: { ...RULE }, overrides: [moved] }),
+		HREF, '"v2"', CAL
+	);
+	assert.deepEqual(merged.overrides, [moved]);
+
+	const flattened = mergeRemote(
+		bound({ recurrence: { ...RULE }, overrides: [moved] }),
+		remote({ recurring: false }), HREF, '"v2"', CAL
+	);
+	assert.equal(flattened.overrides, undefined, "overrides of a series that is gone");
 });
 
 test("a pull adopts the server's rule and exclusions, and marks unreadable ones", () => {
@@ -289,7 +317,7 @@ test("a pull adopts the server's rule and exclusions, and marks unreadable ones"
 
 	const opaque = mergeRemote(bound(), remote({ recurring: true }), HREF, '"v2"', CAL);
 	assert.equal(opaque.recurrence, undefined);
-	assert.equal(opaque.icloud?.unsupportedRule, true);
+	assert.equal(opaque.icloud?.unsupportedRule, RULE_READER_VERSION);
 });
 
 test("a series that stops repeating on the server stops repeating locally", () => {
@@ -347,4 +375,91 @@ test("a resource genuinely deleted elsewhere still unlinks", () => {
 	const actions = planSync({ routeFor: () => CAL, localEvents: [event], calendarUrl: CAL,
 		remoteResources: [], fetched: new Map(), claimedUids: new Set(["someone-else"]) });
 	assert.deepEqual(kinds(actions), ["unlink-local"]);
+});
+
+// --- locked events -----------------------------------------------------------
+
+test("a locked event is never written, moved, deleted or created remotely", () => {
+	const edited = bound({ readOnly: true, title: "Edited locally" },
+		{ localModified: "2026-09-27T00:00:00Z" });
+	const retyped = bound({ readOnly: true });
+	const undated = bound({ readOnly: true, date: undefined });
+	const unbound = local({ readOnly: true, uid: "evt-new" });
+	for (const [label, event, route] of [
+		["a local edit", edited, CAL],
+		["a retype into another calendar", retyped, "https://other/"],
+		["losing its date", undated, CAL],
+		["never having been pushed", unbound, CAL],
+	] as const) {
+		const actions = planSync({ routeFor: () => route, localEvents: [event], calendarUrl: CAL,
+			remoteResources: [{ href: HREF, etag: '"v1"' }], fetched: new Map() });
+		assert.deepEqual(kinds(actions), [], `${label} produced a write`);
+	}
+});
+
+test("a locked event still follows the server, even against a newer local edit", () => {
+	const edited = bound({ readOnly: true }, { localModified: "2026-09-27T00:00:00Z" });
+	const actions = planSync({ routeFor: () => CAL, localEvents: [edited], calendarUrl: CAL,
+		remoteResources: [{ href: HREF, etag: '"v2"' }],
+		fetched: new Map([[HREF, remote({ remoteModified: "2026-01-01T00:00:00Z" })]]) });
+	assert.deepEqual(kinds(actions), ["update-local"]);
+	const merged = mergeRemote(edited, remote(), HREF, '"v2"', CAL);
+	assert.equal(merged.readOnly, true, "a pull must not unlock it");
+});
+
+
+// --- several services share the planner -----------------------------------------
+
+const GCAL = "primary-calendar-id";
+const google = (over: Partial<CalendarEvent> = {}, link: Record<string, unknown> = {}) =>
+	local({ ...over, google: { collection: GCAL, href: "g-evt-1", etag: '"g1"',
+		remoteModified: "2026-09-01T00:00:00Z", localModified: "2026-09-01T00:00:00Z", ...link } });
+
+test("the planner reads whichever service's link it is given", () => {
+	// Bound on Google, edited locally since: a Google update, not an iCloud one.
+	const edited = google({}, { localModified: "2026-09-02T00:00:00Z" });
+	const actions = planSync({ routeFor: () => GCAL, localEvents: [edited], calendarUrl: GCAL,
+		remoteResources: [{ href: "g-evt-1", etag: '"g1"' }], fetched: new Map(),
+		binding: bindingFor("google") });
+	assert.deepEqual(kinds(actions), ["update-remote"]);
+	// The same note seen from iCloud has no iCloud link, so iCloud creates it.
+	const fromIcloud = planSync({ routeFor: () => CAL, localEvents: [edited], calendarUrl: CAL,
+		remoteResources: [], fetched: new Map() });
+	assert.deepEqual(kinds(fromIcloud), ["create-remote"]);
+});
+
+test("an event deleted on a service and kept out of it is not sent there again", () => {
+	const excluded = local({ google: { excluded: true } });
+	const actions = planSync({ routeFor: () => GCAL, localEvents: [excluded], calendarUrl: GCAL,
+		remoteResources: [], fetched: new Map(), binding: bindingFor("google") });
+	assert.deepEqual(kinds(actions), []);
+	// Only that service: iCloud still gets it.
+	const icloud = planSync({ routeFor: () => CAL, localEvents: [excluded], calendarUrl: CAL,
+		remoteResources: [], fetched: new Map() });
+	assert.deepEqual(kinds(icloud), ["create-remote"]);
+});
+
+test("etags are compared on the service being synced, not on iCloud's", () => {
+	const both = google({}, {});
+	both.icloud = { collection: CAL, href: HREF, etag: '"v1"' };
+	assert.deepEqual(
+		resourcesNeedingFetch([both], [{ href: "g-evt-1", etag: '"g2"' }], bindingFor("google")),
+		["g-evt-1"]
+	);
+	assert.deepEqual(
+		resourcesNeedingFetch([both], [{ href: "g-evt-1", etag: '"g1"' }], bindingFor("google")),
+		[]
+	);
+});
+
+test("a pull from Google updates only Google's link and clears an exclusion", () => {
+	const note = bound({}, {});
+	note.google = { excluded: true };
+	const merged = mergeRemote(note, remote({ title: "Moved on the phone" }), "g-evt-1", '"g2"', GCAL,
+		undefined, "google");
+	assert.equal(merged.title, "Moved on the phone");
+	assert.equal(merged.google?.href, "g-evt-1");
+	assert.equal(merged.google?.collection, GCAL);
+	assert.equal(merged.google?.excluded, undefined);
+	assert.deepEqual(merged.icloud, note.icloud, "iCloud's link must not be touched by a Google pull");
 });

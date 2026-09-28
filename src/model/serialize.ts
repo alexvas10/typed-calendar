@@ -1,4 +1,4 @@
-import { CalendarEvent, EventStatus, ICloudMeta } from "./types";
+import { CalendarEvent, EventStatus, ICloudMeta, OccurrenceOverride } from "./types";
 import { parseExceptions, parseRecurrence, recurrenceToFrontmatter } from "./recurrence";
 
 /** Frontmatter keys the plugin owns. Anything else on a note is left alone. */
@@ -17,7 +17,11 @@ export const MANAGED_KEYS = [
 	"props",
 	"recurrence",
 	"exceptions",
+	"overrides",
+	"readOnly",
 	"icloud",
+	"google",
+	"outlook",
 ] as const;
 
 function asString(value: unknown): string | undefined {
@@ -79,6 +83,55 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 /**
+ * Reads the `overrides:` list. An entry without a usable `occurrence` date is
+ * dropped, since there is no telling which occurrence it meant; when two
+ * entries name the same occurrence the later one wins.
+ */
+export function parseOverrides(value: unknown): OccurrenceOverride[] {
+	if (!Array.isArray(value)) return [];
+	const byOccurrence = new Map<string, OccurrenceOverride>();
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const raw = entry as Record<string, unknown>;
+		const occurrence = asDate(raw.occurrence);
+		if (!occurrence) continue;
+
+		const override: OccurrenceOverride = { occurrence };
+		const date = asDate(raw.date);
+		if (date) override.date = date;
+		if (typeof raw.allDay === "boolean") override.allDay = raw.allDay;
+		const startTime = asTime(raw.startTime);
+		if (startTime) override.startTime = startTime;
+		const endTime = asTime(raw.endTime);
+		if (endTime) override.endTime = endTime;
+		for (const key of ["title", "location", "description"] as const) {
+			const text = asString(raw[key]);
+			if (text) override[key] = text;
+		}
+		byOccurrence.set(occurrence, override);
+	}
+	return Array.from(byOccurrence.values()).sort((a, b) =>
+		a.occurrence.localeCompare(b.occurrence)
+	);
+}
+
+/** The `overrides` value to write back, in a stable key order. */
+export function overridesToFrontmatter(overrides: OccurrenceOverride[]): Record<string, unknown>[] {
+	const keys = [
+		"occurrence", "date", "allDay", "startTime", "endTime", "title", "location", "description",
+	] as const;
+	return [...overrides]
+		.sort((a, b) => a.occurrence.localeCompare(b.occurrence))
+		.map((override) => {
+			const out: Record<string, unknown> = {};
+			for (const key of keys) {
+				if (override[key] !== undefined && override[key] !== "") out[key] = override[key];
+			}
+			return out;
+		});
+}
+
+/**
  * Builds an event from a note's frontmatter. Returns null when the note is not
  * an event at all, so the index can cheaply skip unrelated notes in the folder.
  */
@@ -102,6 +155,7 @@ export function eventFromFrontmatter(
 	const status: EventStatus = rawStatus === "tbd" ? "tbd" : "confirmed";
 
 	const exceptions = parseExceptions(frontmatter.exceptions);
+	const overrides = parseOverrides(frontmatter.overrides);
 	const startTime = asTime(frontmatter.startTime);
 	const endTime = asTime(frontmatter.endTime);
 	// An event with no start time cannot be drawn on a timed grid, so treat it
@@ -123,7 +177,13 @@ export function eventFromFrontmatter(
 		props: asRecord(frontmatter.props),
 		recurrence: parseRecurrence(frontmatter.recurrence) ?? undefined,
 		exceptions: exceptions.length > 0 ? exceptions : undefined,
+		overrides: overrides.length > 0 ? overrides : undefined,
+		// Only a literal `true` locks: a typo must not silently unlock, but it
+		// must not silently lock something either.
+		readOnly: frontmatter.readOnly === true ? true : undefined,
 		icloud: frontmatter.icloud ? (asRecord(frontmatter.icloud) as ICloudMeta) : undefined,
+		google: frontmatter.google ? (asRecord(frontmatter.google) as ICloudMeta) : undefined,
+		outlook: frontmatter.outlook ? (asRecord(frontmatter.outlook) as ICloudMeta) : undefined,
 		path,
 	};
 }
@@ -164,7 +224,17 @@ export function applyEventToFrontmatter(
 		"exceptions",
 		event.recurrence && event.exceptions?.length ? [...event.exceptions].sort() : undefined
 	);
-	set("icloud", event.icloud && Object.keys(event.icloud).length > 0 ? event.icloud : undefined);
+	set(
+		"overrides",
+		event.recurrence && event.overrides?.length
+			? overridesToFrontmatter(event.overrides)
+			: undefined
+	);
+	set("readOnly", event.readOnly ? true : undefined);
+	for (const key of ["icloud", "google", "outlook"] as const) {
+		const binding = event[key];
+		set(key, binding && Object.keys(binding).length > 0 ? binding : undefined);
+	}
 }
 
 /** Collision-resistant enough for a single vault, and readable in YAML. */

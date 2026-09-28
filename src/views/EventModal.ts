@@ -1,16 +1,27 @@
 import { App, Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
-import { CalendarEvent, EventType, TypeField } from "../model/types";
+import { CalendarEvent, EventType, OccurrenceOverride, PROVIDER_LABELS, TypeField } from "../model/types";
 import { generateUid } from "../model/serialize";
 import { indexTypes } from "../model/priority";
 import {
 	Frequency,
+	PositionMode,
 	RecurrenceRule,
 	WEEKDAYS,
 	Weekday,
 	describeRecurrence,
+	ordinal,
+	positionInMonth,
+	positionModeOf,
+	positionRule,
 } from "../model/recurrence";
+import { activeOverrides, applyOverride } from "../model/occurrences";
 import { weekdayOf } from "../util/dates";
+import { OccurrenceModal } from "./OccurrenceModal";
+import { TimeRange, renderTimeRange } from "./TimeField";
 import type TypedCalendarPlugin from "../../main";
+
+/** Where and when a new event starts, e.g. from a range dragged on the grid. */
+export type EventPrefill = Partial<Pick<CalendarEvent, "date" | "startTime" | "endTime" | "allDay">>;
 
 export class EventModal extends Modal {
 	private draft: CalendarEvent;
@@ -19,12 +30,13 @@ export class EventModal extends Modal {
 	private readonly occurrence?: string;
 	private propsEl!: HTMLElement;
 	private repeatEl!: HTMLElement;
+	private times: TimeRange | null = null;
 
 	constructor(
 		app: App,
 		private plugin: TypedCalendarPlugin,
 		existing?: CalendarEvent,
-		prefillDate?: string,
+		prefill?: EventPrefill,
 		occurrence?: string
 	) {
 		super(app);
@@ -37,14 +49,17 @@ export class EventModal extends Modal {
 					props: { ...existing.props },
 					recurrence: existing.recurrence ? { ...existing.recurrence } : undefined,
 					exceptions: existing.exceptions ? [...existing.exceptions] : undefined,
+					overrides: existing.overrides?.map((override) => ({ ...override })),
 				}
 			: {
 					uid: generateUid(),
 					title: "",
 					types: [],
-					allDay: true,
+					allDay: prefill?.allDay ?? !prefill?.startTime,
+					startTime: prefill?.startTime,
+					endTime: prefill?.endTime,
 					status: "confirmed",
-					date: prefillDate,
+					date: prefill?.date,
 					props: {},
 					timezone: plugin.settings.defaultTimezone,
 					path: "",
@@ -56,6 +71,16 @@ export class EventModal extends Modal {
 		contentEl.empty();
 		contentEl.addClass("tc-modal");
 		this.setTitle(this.isNew ? "New event" : "Edit event");
+
+		if (this.draft.readOnly) {
+			contentEl.createEl("p", {
+				cls: "setting-item-description tc-settings-note",
+				text:
+					"Locked. Edits here stay in this note and are never sent to any synced calendar, " +
+					"and the event cannot be deleted from here. Remove `readOnly: true` " +
+					"from the note to unlock it.",
+			});
+		}
 
 		new Setting(contentEl).setName("Title").addText((text) =>
 			text
@@ -76,7 +101,9 @@ export class EventModal extends Modal {
 			.addText((text) => {
 				text.inputEl.type = "date";
 				text.setValue(this.draft.date ?? "").onChange((value) => {
+					const previous = this.draft.date;
 					this.draft.date = value || undefined;
+					this.followDate(previous);
 				});
 			});
 
@@ -94,19 +121,13 @@ export class EventModal extends Modal {
 				})
 			);
 
-		const startSetting = new Setting(contentEl).setName("Start time").addText((text) => {
-			text.inputEl.type = "time";
-			text.setValue(this.draft.startTime ?? "").onChange((value) => {
-				this.draft.startTime = value || undefined;
-			});
+		this.times = renderTimeRange(contentEl, {
+			getStart: () => this.draft.startTime,
+			setStart: (value) => (this.draft.startTime = value),
+			getEnd: () => this.draft.endTime,
+			setEnd: (value) => (this.draft.endTime = value),
 		});
-
-		const endSetting = new Setting(contentEl).setName("End time").addText((text) => {
-			text.inputEl.type = "time";
-			text.setValue(this.draft.endTime ?? "").onChange((value) => {
-				this.draft.endTime = value || undefined;
-			});
-		});
+		const { startSetting, endSetting } = this.times;
 
 		// The values are kept rather than cleared, so turning the toggle back off
 		// returns what the user had typed. submit() drops them for an all-day
@@ -129,12 +150,29 @@ export class EventModal extends Modal {
 
 		new Setting(contentEl)
 			.setName("Awaiting details")
-			.setDesc("Keeps the event out of the calendar and out of iCloud even if it has a date.")
+			.setDesc("Keeps the event out of the calendar and out of every synced calendar, even if it has a date.")
 			.addToggle((toggle) =>
 				toggle.setValue(this.draft.status === "tbd").onChange((value) => {
 					this.draft.status = value ? "tbd" : "confirmed";
 				})
 			);
+
+		// Deleted on a service and, under the default deletion setting, kept out
+		// of it. Offered here so it can be sent back without editing the note.
+		for (const key of ["icloud", "google", "outlook"] as const) {
+			if (!this.draft[key]?.excluded) continue;
+			const name = PROVIDER_LABELS[key];
+			const setting = new Setting(contentEl)
+				.setName(`Not in ${name}`)
+				.setDesc(`It was deleted there, so it is no longer sent to ${name}.`);
+			setting.addButton((button) =>
+				button.setButtonText(`Send it back to ${name}`).onClick(() => {
+					this.draft[key] = undefined;
+					setting.setDesc(`Will be sent to ${name} on the next sync once saved.`);
+					button.setDisabled(true);
+				})
+			);
+		}
 
 		this.propsEl = contentEl.createDiv();
 		this.renderProps();
@@ -161,14 +199,14 @@ export class EventModal extends Modal {
 				)
 				.addButton((button) => {
 					// Two clicks rather than a confirm dialog: this removes the
-					// event from iCloud as well as the vault, and the second click
+					// event from every synced calendar as well as the vault, and the second click
 					// has to be deliberate.
 					let armed = false;
 					button.setButtonText("Delete").setWarning();
 					button.onClick(() => {
 						if (!armed) {
 							armed = true;
-							button.setButtonText("Delete from iCloud too?");
+							button.setButtonText(this.linked() ? "Delete from synced calendars too?" : "Really delete?");
 							window.setTimeout(() => {
 								armed = false;
 								button.setButtonText("Delete");
@@ -182,6 +220,7 @@ export class EventModal extends Modal {
 	}
 
 	onClose(): void {
+		this.times?.destroy();
 		this.contentEl.empty();
 	}
 
@@ -293,7 +332,10 @@ export class EventModal extends Modal {
 				dropdown.onChange((value) => {
 					this.draft.recurrence =
 						value === "none" ? undefined : this.ruleFor(value as Frequency);
-					if (!this.draft.recurrence) this.draft.exceptions = undefined;
+					if (!this.draft.recurrence) {
+						this.draft.exceptions = undefined;
+						this.draft.overrides = undefined;
+					}
 					this.renderRepeat();
 				});
 			});
@@ -302,11 +344,11 @@ export class EventModal extends Modal {
 			// Turning a repeat off cannot be pushed: from the server's side it
 			// is indistinguishable from a note that never knew about the rule,
 			// and guessing wrong deletes a whole term of classes.
-			if (this.draft.icloud?.recurring) {
+			if (this.repeatsRemotely()) {
 				this.repeatEl.createEl("p", {
 					cls: "setting-item-description tc-settings-note",
 					text:
-						"This event still repeats on iCloud. Removing the repeat here is not " +
+						"This event still repeats in a synced calendar. Removing the repeat here is not " +
 						"sent to the server \u2014 delete the event and create it again instead.",
 				});
 			}
@@ -335,6 +377,7 @@ export class EventModal extends Modal {
 			});
 
 		if (rule.freq === "weekly") this.renderWeekdayPicker(rule);
+		if (rule.freq === "monthly" || rule.freq === "yearly") this.renderPositionPicker(rule);
 
 		new Setting(this.repeatEl)
 			.setName("Repeat until")
@@ -360,11 +403,11 @@ export class EventModal extends Modal {
 			// Turning a repeat off cannot be pushed: from the server's side it
 			// is indistinguishable from a note that never knew about the rule,
 			// and guessing wrong deletes a whole term of classes.
-			if (this.draft.icloud?.recurring) {
+			if (this.repeatsRemotely()) {
 				this.repeatEl.createEl("p", {
 					cls: "setting-item-description tc-settings-note",
 					text:
-						"This event still repeats on iCloud. Removing the repeat here is not " +
+						"This event still repeats in a synced calendar. Removing the repeat here is not " +
 						"sent to the server \u2014 delete the event and create it again instead.",
 				});
 			}
@@ -404,6 +447,83 @@ export class EventModal extends Modal {
 	}
 
 	/**
+	 * Monthly and yearly: the same day of the month, or the same weekday
+	 * position -- "the second Tuesday", "the last Friday". The options are
+	 * worked out from the start date, the way Apple and Google offer them,
+	 * rather than asking for a position and a weekday separately.
+	 */
+	private renderPositionPicker(rule: RecurrenceRule): void {
+		const date = this.draft.date;
+		if (!date) return;
+
+		const dayNames: Record<Weekday, string> = {
+			SU: "Sunday", MO: "Monday", TU: "Tuesday", WE: "Wednesday",
+			TH: "Thursday", FR: "Friday", SA: "Saturday",
+		};
+		const monthName = new Date(`${date}T00:00:00`).toLocaleString(undefined, { month: "long" });
+		const dayOfMonth = Number(date.slice(8, 10));
+		const position = positionInMonth(date);
+		const within = rule.freq === "yearly" ? ` of ${monthName}` : "";
+
+		const options: Array<[PositionMode, string]> = [
+			["day", rule.freq === "yearly" ? `On ${monthName} ${dayOfMonth}` : `On day ${dayOfMonth}`],
+		];
+		// A fifth weekday is only offered as "last": "the fifth Tuesday" misses
+		// most months, which is rarely what anyone wants from a monthly event.
+		if (position.nth <= 4) {
+			options.push(["nth", `On the ${ordinal(position.nth)} ${dayNames[position.day]}${within}`]);
+		}
+		if (position.isLast) {
+			options.push(["last", `On the last ${dayNames[position.day]}${within}`]);
+		}
+		const current = positionModeOf(rule, date);
+		if (!options.some(([mode]) => mode === current)) {
+			options.push(["custom", describeRecurrence(rule)]);
+		}
+
+		new Setting(this.repeatEl)
+			.setName("Repeat on")
+			.setDesc(
+				current === "custom"
+					? "Set in Apple Calendar or by hand. Pick another option to replace it."
+					: "The same date each time, or the same weekday position."
+			)
+			.addDropdown((dropdown) => {
+				for (const [mode, label] of options) dropdown.addOption(mode, label);
+				dropdown.setValue(current);
+				dropdown.onChange((value) => {
+					if (value === "custom") return;
+					this.draft.recurrence = positionRule(
+						rule,
+						value as Exclude<PositionMode, "custom">,
+						date
+					);
+					this.renderRepeat();
+				});
+			});
+	}
+
+	/**
+	 * Keeps a positional rule attached to the start date when it moves: an
+	 * event set to "the second Tuesday" and moved to a third Wednesday means
+	 * "the third Wednesday" now, not a rule that no longer includes its own
+	 * start.
+	 */
+	private followDate(previous: string | undefined): void {
+		const rule = this.draft.recurrence;
+		const date = this.draft.date;
+		if (!rule || !date || !previous) return;
+		if (rule.freq !== "monthly" && rule.freq !== "yearly") return;
+
+		const mode = positionModeOf(rule, previous);
+		if (mode === "nth" || mode === "last") {
+			const next = mode === "last" && positionInMonth(date).isLast ? "last" : "nth";
+			this.draft.recurrence = positionRule(rule, next, date);
+		}
+		this.renderRepeat();
+	}
+
+	/**
 	 * Skipped occurrences: a class that falls on a holiday. They are listed
 	 * rather than hidden so a cancellation made by accident can be undone.
 	 */
@@ -411,24 +531,39 @@ export class EventModal extends Modal {
 		const skipped = this.draft.exceptions ?? [];
 
 		if (this.occurrence) {
-			const isSkipped = skipped.includes(this.occurrence);
-			new Setting(this.repeatEl)
-				.setName(`This occurrence — ${this.occurrence}`)
+			const occurrence = this.occurrence;
+			const isSkipped = skipped.includes(occurrence);
+			const changed = this.draft.overrides?.some((o) => o.occurrence === occurrence);
+			const setting = new Setting(this.repeatEl)
+				.setName(`This occurrence — ${occurrence}`)
 				.setDesc(
 					isSkipped
 						? "Currently skipped. The rest of the series is unaffected."
-						: "Remove just this date, for a holiday or a cancelled class."
-				)
-				.addButton((button) =>
-					button
-						.setButtonText(isSkipped ? "Restore this occurrence" : "Skip this occurrence")
-						.setWarning()
-						.onClick(() => {
-							this.toggleException(this.occurrence as string);
-							void this.submit();
-						})
+						: changed
+							? "Changed on its own. Move, retime or skip just this date."
+							: "Move, retime or skip just this date, for a holiday or a room change."
 				);
+			if (!isSkipped) {
+				setting.addButton((button) =>
+					button
+						.setButtonText("Change this occurrence")
+						.onClick(() => this.editOccurrence(occurrence))
+				);
+			}
+			setting.addButton((button) =>
+				button
+					.setButtonText(isSkipped ? "Restore this occurrence" : "Skip this occurrence")
+					.setWarning()
+					.onClick(() => {
+						this.toggleException(occurrence);
+						// A skipped date has nothing left to change.
+						if (!isSkipped) this.setOverride(occurrence, null);
+						void this.submit();
+					})
+			);
 		}
+
+		this.renderChangedOccurrences();
 
 		if (skipped.length === 0) return;
 
@@ -444,6 +579,62 @@ export class EventModal extends Modal {
 				this.renderRepeat();
 			});
 		}
+	}
+
+	/**
+	 * Occurrences changed on their own, listed so one changed by accident can
+	 * be found and put back. Only those that still apply are shown; one whose
+	 * date the rule no longer produces is kept in the note but inert.
+	 */
+	private renderChangedOccurrences(): void {
+		const changed = activeOverrides(this.draft);
+		if (changed.length === 0) return;
+
+		const setting = new Setting(this.repeatEl)
+			.setName("Changed occurrences")
+			.setDesc("Dates that differ from the series. Click one to edit or reset it.");
+		const list = setting.controlEl.createDiv({ cls: "tc-filter-bar tc-modal-types" });
+		for (const override of changed) {
+			const instance = applyOverride(this.draft, override.occurrence, override);
+			const moved = instance.date !== override.occurrence ? ` → ${instance.date}` : "";
+			const time = instance.startTime ? ` ${instance.startTime}` : "";
+			const chip = list.createEl("button", {
+				cls: "tc-chip is-active",
+				text: `${override.occurrence}${moved}${time}`,
+			});
+			chip.addEventListener("click", (evt) => {
+				evt.preventDefault();
+				this.editOccurrence(override.occurrence);
+			});
+		}
+	}
+
+	/**
+	 * Opens the single-occurrence editor. Its result is folded into this
+	 * draft and saved together with it, so an unsaved edit to the series is
+	 * not lost to the occurrence being written on its own.
+	 */
+	private editOccurrence(occurrence: string): void {
+		if (!this.draft.date || !this.draft.recurrence) return;
+		new OccurrenceModal(
+			this.app,
+			this.draft,
+			occurrence,
+			(override) => {
+				this.setOverride(occurrence, override);
+				void this.submit();
+			},
+			() => {
+				this.setOverride(occurrence, null);
+				void this.submit();
+			}
+		).open();
+	}
+
+	private setOverride(occurrence: string, override: OccurrenceOverride | null): void {
+		const others = (this.draft.overrides ?? []).filter((o) => o.occurrence !== occurrence);
+		const next = override ? [...others, override] : others;
+		this.draft.overrides = next.length > 0 ? next : undefined;
 	}
 
 	private toggleException(date: string): void {
@@ -467,7 +658,17 @@ export class EventModal extends Modal {
 		return rule;
 	}
 
-	/** Deletes the event everywhere: iCloud first, then the note. */
+	/** True when any synced calendar holds this event. */
+	private linked(): boolean {
+		return (["icloud", "google", "outlook"] as const).some((key) => Boolean(this.draft[key]?.href));
+	}
+
+	/** True when a synced calendar's copy repeats. */
+	private repeatsRemotely(): boolean {
+		return (["icloud", "google", "outlook"] as const).some((key) => Boolean(this.draft[key]?.recurring));
+	}
+
+	/** Deletes the event everywhere: every synced calendar first, then the note. */
 	private async remove(): Promise<void> {
 		try {
 			await this.plugin.deleteEvent(this.draft);

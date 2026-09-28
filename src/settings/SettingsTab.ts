@@ -1,7 +1,8 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type TypedCalendarPlugin from "../../main";
-import { EventType, FieldType, TypeField } from "../model/types";
+import { CALENDAR_FIELD, EventType, FieldType, TypeField } from "../model/types";
 import { autoMapCalendars } from "../sync/routing";
+import { DeleteMode } from "./settings";
 
 const FIELD_TYPES: Record<FieldType, string> = {
 	text: "Text",
@@ -12,8 +13,44 @@ const FIELD_TYPES: Record<FieldType, string> = {
 };
 
 export class TypedCalendarSettingTab extends PluginSettingTab {
+	/**
+	 * Folder and timezone edits typed but not yet applied; see
+	 * `commitOnFinish`. Held here rather than written into the settings, so
+	 * nothing reads a half-typed value in the meantime.
+	 */
+	private pending = new Map<string, () => void>();
+
 	constructor(app: App, private plugin: TypedCalendarPlugin) {
 		super(app, plugin);
+	}
+
+	/** Closing settings counts as finishing an edit. */
+	hide(): void {
+		void this.commitPending();
+	}
+
+	private async commitPending(): Promise<void> {
+		if (this.pending.size === 0) return;
+		for (const apply of this.pending.values()) apply();
+		this.pending.clear();
+		await this.plugin.saveSettings();
+	}
+
+	/** Queues `apply` for when the edit is finished, replacing an earlier one for `key`. */
+	private defer(key: string, apply: () => void): void {
+		this.pending.set(key, apply);
+	}
+
+	/**
+	 * Saves a text field when the user finishes with it -- leaving the field,
+	 * pressing Enter, or closing settings -- rather than on every key.
+	 *
+	 * For the folder this is not just tidiness: each save re-indexes the vault
+	 * under the folder as typed so far and writes the agent docs into it, so
+	 * typing "Calendar/Events" used to create folders "C", "Ca", "Cal", ...
+	 */
+	private commitOnFinish(input: HTMLInputElement): void {
+		input.addEventListener("change", () => void this.commitPending());
 	}
 
 	display(): void {
@@ -27,10 +64,12 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 				text
 					.setPlaceholder("Calendar/Events")
 					.setValue(this.plugin.settings.eventFolder)
-					.onChange(async (value) => {
-						this.plugin.settings.eventFolder = value.replace(/^\/+|\/+$/g, "");
-						await this.plugin.saveSettings();
+					.onChange((value) => {
+						this.defer("folder", () => {
+							this.plugin.settings.eventFolder = value.replace(/^\/+|\/+$/g, "");
+						});
 					})
+					.then((text) => this.commitOnFinish(text.inputEl))
 			);
 
 		new Setting(containerEl)
@@ -54,10 +93,14 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 			.addText((text) =>
 				text
 					.setValue(this.plugin.settings.defaultTimezone)
-					.onChange(async (value) => {
-						this.plugin.settings.defaultTimezone = value.trim();
-						await this.plugin.saveSettings();
+					.onChange((value) => {
+						// A half-typed zone ("America/To") must not be stamped onto an
+						// event created meanwhile.
+						this.defer("timezone", () => {
+							this.plugin.settings.defaultTimezone = value.trim();
+						});
 					})
+					.then((text) => this.commitOnFinish(text.inputEl))
 			);
 
 		new Setting(containerEl)
@@ -75,6 +118,9 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 			);
 
 		this.renderSync(containerEl);
+		this.renderOAuthService(containerEl, "google");
+		this.renderOAuthService(containerEl, "outlook");
+		this.renderSyncGeneral(containerEl);
 
 		new Setting(containerEl).setName("Event types").setHeading();
 
@@ -222,6 +268,178 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 					});
 				});
 		}
+	}
+
+	/**
+	 * Google Calendar or Outlook: the app registration, sign-in, and which
+	 * calendars take part. Sign-in uses the user's own registration for now;
+	 * a built-in one for everyone is planned (see handoff.md).
+	 */
+	private renderOAuthService(containerEl: HTMLElement, key: "google" | "outlook"): void {
+		const service = this.plugin.settings[key];
+		const google = key === "google";
+		const label = google ? "Google Calendar" : "Outlook";
+
+		new Setting(containerEl).setName(`${label} sync`).setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description tc-settings-note",
+			text: google
+				? "Needs your own Google Cloud OAuth client (type: Desktop app) with the Google Calendar API " +
+					"enabled; the README walks through it in a few minutes. Sign-in happens in your browser, " +
+					"and the plugin never sees your password."
+				: "Needs your own Azure app registration (platform: Mobile and desktop, redirect " +
+					"http://localhost, accounts in any organization and personal Microsoft accounts); the README " +
+					"walks through it. Sign-in happens in your browser, and the plugin never sees your password.",
+		});
+
+		new Setting(containerEl)
+			.setName(google ? "OAuth client ID" : "Application (client) ID")
+			.addText((text) =>
+				text
+					.setPlaceholder(google ? "…apps.googleusercontent.com" : "00000000-0000-0000-0000-000000000000")
+					.setValue(service.clientId)
+					.onChange(async (value) => {
+						service.clientId = value.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+		if (google) {
+			new Setting(containerEl)
+				.setName("OAuth client secret")
+				.setDesc("Google's desktop clients have one; it is not a password.")
+				.addText((text) => {
+					text.inputEl.type = "password";
+					text.setValue(service.clientSecret).onChange(async (value) => {
+						service.clientSecret = value.trim();
+						await this.plugin.saveSettings();
+					});
+				});
+		}
+
+		const account = new Setting(containerEl).setName("Account");
+		if (service.tokens) {
+			account.setDesc(service.account ? `Signed in as ${service.account}.` : "Signed in.");
+			account.addButton((button) =>
+				button.setButtonText("Sign out").onClick(async () => {
+					await this.plugin.account(key).signOut();
+					service.account = "";
+					await this.plugin.saveSettings();
+					this.display();
+				})
+			);
+		} else {
+			account.setDesc(
+				service.clientId ? "Not signed in." : `Add the ${google ? "client ID and secret" : "client ID"} first.`
+			);
+			account.addButton((button) =>
+				button
+					.setButtonText("Sign in")
+					.setCta()
+					.setDisabled(!service.clientId || (google && !service.clientSecret))
+					.onClick(async () => {
+						button.setButtonText("Waiting for the browser…").setDisabled(true);
+						try {
+							await this.plugin.account(key).signIn((url) => window.open(url));
+							service.account = await this.plugin.provider(key).accountName().catch(() => "");
+							await this.plugin.saveSettings();
+							new Notice(`Signed in to ${label}${service.account ? ` as ${service.account}` : ""}.`);
+						} catch (error) {
+							new Notice((error as Error).message);
+						}
+						this.display();
+					})
+			);
+		}
+		if (!service.tokens) return;
+
+		new Setting(containerEl)
+			.setName("Calendars")
+			.setDesc(
+				service.calendars.length > 0
+					? "Toggle which calendars take part in sync. Enabling one copies every event that routes there into it."
+					: "Find the calendars on this account."
+			)
+			.addButton((button) =>
+				button
+					.setButtonText("Discover calendars")
+					.setCta()
+					.onClick(async () => {
+						button.setButtonText("Discovering…").setDisabled(true);
+						try {
+							const found = await this.plugin.provider(key).listCalendars();
+							const previous = new Map(service.calendars.map((c) => [c.url, c.enabled]));
+							service.calendars = found.map((calendar) => ({
+								url: calendar.id,
+								displayName: calendar.name,
+								readOnly: calendar.readOnly,
+								enabled: previous.get(calendar.id) ?? false,
+							}));
+							const mapped = autoMapCalendars(
+								this.plugin.settings.eventTypes,
+								service.calendars,
+								CALENDAR_FIELD[key]
+							);
+							this.plugin.settings.eventTypes = mapped.types;
+							await this.plugin.saveSettings();
+							new Notice(
+								`Found ${found.length} calendar(s).\n` +
+									(mapped.mappings.length ? mapped.mappings.join("\n") : "No new mappings.")
+							);
+						} catch (error) {
+							new Notice(`Discovery failed: ${(error as Error).message}`);
+						}
+						this.display();
+					})
+			);
+
+		for (const calendar of service.calendars) {
+			new Setting(containerEl)
+				.setName(calendar.displayName)
+				.setDesc(calendar.readOnly ? "Read-only for this account" : "Two-way")
+				.addToggle((toggle) =>
+					toggle.setValue(calendar.enabled).onChange(async (value) => {
+						calendar.enabled = value;
+						await this.plugin.saveSettings();
+					})
+				);
+		}
+
+		if (service.calendars.length > 0) {
+			new Setting(containerEl)
+				.setName("Default calendar")
+				.setDesc("Where events go when none of their types maps to a calendar here.")
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "Don't sync them");
+					for (const calendar of service.calendars) dropdown.addOption(calendar.url, calendar.displayName);
+					dropdown.setValue(service.fallbackCalendar);
+					dropdown.onChange(async (value) => {
+						service.fallbackCalendar = value;
+						await this.plugin.saveSettings();
+					});
+				});
+		}
+	}
+
+	/** Settings that apply to every service. */
+	private renderSyncGeneral(containerEl: HTMLElement): void {
+		const { caldav } = this.plugin.settings;
+		new Setting(containerEl).setName("Sync").setHeading();
+
+		new Setting(containerEl)
+			.setName("When an event is deleted in one calendar")
+			.setDesc(
+				"Deleting from Obsidian always removes an event everywhere. This decides what a deletion " +
+					"made on a phone or in a calendar app does to the other copies."
+			)
+			.addDropdown((dropdown) => {
+				dropdown.addOption("this-calendar", "Remove it from that calendar only");
+				dropdown.addOption("everywhere", "Delete it everywhere");
+				dropdown.setValue(this.plugin.settings.deleteMode);
+				dropdown.onChange(async (value) => {
+					this.plugin.settings.deleteMode = value as DeleteMode;
+					await this.plugin.saveSettings();
+				});
+			});
 
 		new Setting(containerEl)
 			.setName("Sync every")
@@ -326,6 +544,32 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 				? `Custom fields (${type.fields.length}) and rank`
 				: "Custom fields and rank",
 		});
+
+		// iCloud's picker sits in the row above, since it came first; the other
+		// services appear here once they have calendars to choose from.
+		for (const key of ["google", "outlook"] as const) {
+			const calendars = this.plugin.settings[key].calendars;
+			if (calendars.length === 0) continue;
+			const field = CALENDAR_FIELD[key];
+			new Setting(details)
+				.setName(key === "google" ? "Google calendar" : "Outlook calendar")
+				.setDesc("Where events of this type go on that service.")
+				.addDropdown((dropdown) => {
+					dropdown.addOption("", "No calendar");
+					for (const calendar of calendars) dropdown.addOption(calendar.url, calendar.displayName);
+					dropdown.setValue(type[field] ?? "");
+					dropdown.onChange(async (value) => {
+						// One type per calendar, as for iCloud.
+						if (value) {
+							for (const other of this.plugin.settings.eventTypes) {
+								if (other.id !== type.id && other[field] === value) delete other[field];
+							}
+						}
+						type[field] = value || undefined;
+						await this.plugin.saveSettings();
+					});
+				});
+		}
 
 		new Setting(details)
 			.setName("Rank")

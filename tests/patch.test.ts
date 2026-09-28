@@ -103,23 +103,247 @@ test("an unchanged series with a readable rule yields no write", () => {
 });
 
 test("a rule the plugin cannot read is refused rather than replaced", () => {
-	const exotic = APPLE.replace("SEQUENCE:2", "SEQUENCE:2\r\nRRULE:FREQ=MONTHLY;BYSETPOS=1;BYDAY=MO");
+	const exotic = APPLE.replace("SEQUENCE:2", "SEQUENCE:2\r\nRRULE:FREQ=YEARLY;BYWEEKNO=20;BYDAY=MO");
 	const r = patchICS(exotic, series({ title: "Renamed" }), TO)!;
 	assert.equal(r.pullOnly, true);
 	assert.equal(r.changed, false);
 	assert.equal(r.ics, exotic);
 });
 
-test("per-occurrence overrides make a series untouchable", () => {
-	const withOverride = RECURRING.replace(
+// --- per-occurrence overrides --------------------------------------------------
+
+// A Wednesday class, with the 18 Feb lecture moved to Thursday evening in
+// another room -- the way Apple stores it: a second VEVENT with the same UID
+// and a RECURRENCE-ID naming the occurrence it replaces, carrying its own alarm.
+const WEDNESDAYS = APPLE.replace("SEQUENCE:2", "SEQUENCE:2\r\nRRULE:FREQ=WEEKLY;BYDAY=WE");
+const MOVED_COMPONENT = [
+	"BEGIN:VEVENT", "UID:apple-1", "RECURRENCE-ID;TZID=America/Toronto:20260218T180000",
+	"DTSTART;TZID=America/Toronto:20260219T190000", "DTEND;TZID=America/Toronto:20260219T210000",
+	"SUMMARY:2214 Test 1", "LOCATION:DC 1350", "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC",
+	"LAST-MODIFIED:20260107T160506Z", "DTSTAMP:20260107T160506Z",
+	"BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:-PT15M", "DESCRIPTION:Moved", "END:VALARM",
+	"END:VEVENT",
+].join("\r\n");
+const WITH_MOVE = WEDNESDAYS.replace("END:VCALENDAR", `${MOVED_COMPONENT}\r\nEND:VCALENDAR`);
+const MOVE = {
+	occurrence: "2026-02-18", date: "2026-02-19", startTime: "19:00", endTime: "21:00",
+	location: "DC 1350",
+};
+const wednesdays = (over: Partial<CalendarEvent> = {}) =>
+	series({ recurrence: { ...WEEKLY }, ...over });
+
+/** The RECURRENCE-ID components of a body, in document order. */
+const instances = (ics: string) =>
+	new ICAL.Component(ICAL.parse(ics))
+		.getAllSubcomponents("vevent")
+		.filter((component) => component.getFirstPropertyValue("recurrence-id"));
+
+test("a moved occurrence is read as just what differs from the series", () => {
+	const parsed = icsToEvent(WITH_MOVE, TO)!;
+	assert.ok(parsed.recurrence, "a series with an override is no longer pull-only");
+	assert.deepEqual(parsed.overrides, [MOVE]);
+	assert.equal(parsed.title, "2214 Test 1", "the master is still the series");
+});
+
+test("a series whose overrides already match is not rewritten", () => {
+	const r = patchICS(WITH_MOVE, wednesdays({ overrides: [{ ...MOVE }] }), TO)!;
+	assert.equal(r.changed, false);
+	assert.equal(r.pullOnly, false);
+	assert.equal(r.ics, WITH_MOVE);
+});
+
+test("renaming the series carries into the moved occurrence and keeps its alarm", () => {
+	const r = patchICS(WITH_MOVE, wednesdays({ title: "2214 Lecture", overrides: [{ ...MOVE }] }), TO)!;
+	assert.equal(r.changed, true);
+	const [moved] = instances(r.ics);
+	assert.equal(moved.getFirstPropertyValue("summary"), "2214 Lecture");
+	assert.equal(moved.getFirstPropertyValue("location"), "DC 1350");
+	assert.ok(moved.getFirstSubcomponent("valarm"), "the occurrence lost its own alarm");
+	assert.ok(r.ics.includes("TRIGGER:-PT30M"), "the series lost its alarm");
+	assert.deepEqual(icsToEvent(r.ics, TO)!.overrides, [MOVE]);
+});
+
+test("changing a moved occurrence edits its component in place", () => {
+	const r = patchICS(
+		WITH_MOVE,
+		wednesdays({ overrides: [{ ...MOVE, location: "MC 1085" }] }),
+		TO
+	)!;
+	assert.equal(r.changed, true);
+	const [moved] = instances(r.ics);
+	assert.equal(moved.getFirstPropertyValue("location"), "MC 1085");
+	assert.match(r.ics, /DTSTART;TZID=America\/Toronto:20260219T190000/, "untouched timing was rewritten");
+	assert.ok(r.ics.includes("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR"), "lost the component's own properties");
+});
+
+test("resetting an occurrence to the series removes its component", () => {
+	const r = patchICS(WITH_MOVE, wednesdays(), TO)!;
+	assert.equal(r.changed, true);
+	assert.equal(instances(r.ics).length, 0);
+	assert.ok(r.ics.includes("TRIGGER:-PT30M"), "the series lost its alarm");
+	assert.equal(icsToEvent(r.ics, TO)!.overrides, undefined);
+});
+
+test("moving one occurrence adds a component that names it the way DTSTART does", () => {
+	const move = { occurrence: "2026-02-25", startTime: "20:00", endTime: "21:30" };
+	const r = patchICS(WEDNESDAYS, wednesdays({ overrides: [move] }), TO)!;
+	assert.equal(r.changed, true);
+	// DTSTART is TZID-qualified local time; a UTC RECURRENCE-ID would be
+	// within the server's rights to match nothing.
+	assert.match(r.ics, /RECURRENCE-ID;TZID=America\/Toronto:20260225T180000/);
+	const [added] = instances(r.ics);
+	assert.ok(added.getFirstSubcomponent("valarm"), "a detached occurrence should keep the series' alarm");
+	assert.deepEqual(icsToEvent(r.ics, TO)!.overrides, [move]);
+	assert.ok(r.ics.includes("RRULE:FREQ=WEEKLY;BYDAY=WE"), "lost or rewrote the rule");
+});
+
+test("retiming the series re-points every RECURRENCE-ID at the new start", () => {
+	const r = patchICS(
+		WITH_MOVE,
+		wednesdays({ startTime: "17:00", endTime: "19:00", overrides: [{ ...MOVE }] }),
+		TO
+	)!;
+	assert.equal(r.changed, true);
+	assert.match(r.ics, /RECURRENCE-ID;TZID=America\/Toronto:20260218T170000/);
+	assert.deepEqual(icsToEvent(r.ics, TO)!.overrides, [MOVE]);
+});
+
+test("an override that changes nothing modelled survives, so its alarm does too", () => {
+	// Only the alarm differs on this occurrence. Reading it as "no override"
+	// would make the next push delete the component, and the alarm with it.
+	const alarmOnly = WEDNESDAYS.replace(
 		"END:VCALENDAR",
-		["BEGIN:VEVENT", "UID:apple-1", "RECURRENCE-ID;TZID=America/Toronto:20260218T180000",
-			"DTSTART;TZID=America/Toronto:20260218T190000", "SUMMARY:2214 Test 1",
-			"END:VEVENT", "END:VCALENDAR"].join("\r\n")
+		MOVED_COMPONENT.replace("DTSTART;TZID=America/Toronto:20260219T190000", "DTSTART;TZID=America/Toronto:20260218T180000")
+			.replace("DTEND;TZID=America/Toronto:20260219T210000", "DTEND;TZID=America/Toronto:20260218T200000")
+			.replace("LOCATION:DC 1350", "LOCATION:MC 4021") + "\r\nEND:VCALENDAR"
 	);
-	const r = patchICS(withOverride, series({ title: "Renamed" }), TO)!;
+	const parsed = icsToEvent(alarmOnly, TO)!;
+	assert.deepEqual(parsed.overrides, [{ occurrence: "2026-02-18" }]);
+	const r = patchICS(alarmOnly, wednesdays({ overrides: parsed.overrides }), TO)!;
+	assert.equal(r.changed, false);
+});
+
+test("an override for a date the series does not produce is never written", () => {
+	// 17 Feb is a Tuesday; the class meets on Wednesdays.
+	const r = patchICS(WEDNESDAYS, wednesdays({ overrides: [{ occurrence: "2026-02-17", location: "X" }] }), TO)!;
+	assert.equal(r.changed, false);
+	assert.equal(instances(r.ics).length, 0);
+});
+
+test("a skipped occurrence is not changed, but its server copy is not deleted either", () => {
+	// Skipping through the plugin drops the override from the note first, so
+	// the component goes on the next write (see the reset test). An entry
+	// still listed beside an exclusion is left exactly as the server has it:
+	// deleting a change made in Apple Calendar should take a deliberate reset.
+	const r = patchICS(
+		WITH_MOVE,
+		wednesdays({ exceptions: ["2026-02-18"], overrides: [{ ...MOVE, location: "Elsewhere" }] }),
+		TO
+	)!;
+	assert.deepEqual(icsToEvent(r.ics, TO)!.exceptions, ["2026-02-18"]);
+	const [kept] = instances(r.ics);
+	assert.equal(kept.getFirstPropertyValue("location"), "DC 1350", "an inert override was edited");
+});
+
+test("a series whose override names a date the rule does not produce stays pull-only", () => {
+	// 17 Feb is a Tuesday; this series meets on Wednesdays. The server and the
+	// plugin disagree about the series, so the plugin must not own it.
+	const stray = WEDNESDAYS.replace(
+		"END:VCALENDAR",
+		MOVED_COMPONENT.replace("RECURRENCE-ID;TZID=America/Toronto:20260218T180000",
+			"RECURRENCE-ID;TZID=America/Toronto:20260217T180000") + "\r\nEND:VCALENDAR"
+	);
+	assert.equal(icsToEvent(stray, TO)!.recurrence, undefined);
+	const r = patchICS(stray, wednesdays({ title: "Renamed" }), TO)!;
 	assert.equal(r.pullOnly, true);
-	assert.equal(r.ics, withOverride);
+	assert.equal(r.ics, stray);
+});
+
+test("Apple's moved first occurrence: DTSTART off-rule, moved onto a rule day", () => {
+	// The shape of the user's CS1027: DTSTART on a Monday, rule TU/TH, the
+	// Monday occurrence moved to Tuesday and that Tuesday's own occurrence
+	// excluded. The start date is always an occurrence, so this is readable.
+	const series = [
+		"BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Apple Inc.//macOS//EN",
+		"BEGIN:VEVENT", "UID:cs1027", "SUMMARY:CS1027",
+		"DTSTART;TZID=America/Toronto:20250106T123000", "DTEND;TZID=America/Toronto:20250106T133000",
+		"RRULE:FREQ=WEEKLY;UNTIL=20250405T035959Z;BYDAY=TU,TH",
+		"EXDATE;TZID=America/Toronto:20250107T123000",
+		"END:VEVENT",
+		"BEGIN:VEVENT", "UID:cs1027", "RECURRENCE-ID;TZID=America/Toronto:20250106T123000",
+		"DTSTART;TZID=America/Toronto:20250107T123000", "DTEND;TZID=America/Toronto:20250107T133000",
+		"SUMMARY:CS1027", "END:VEVENT",
+		"END:VCALENDAR",
+	].join("\r\n");
+	const parsed = icsToEvent(series, TO)!;
+	assert.deepEqual(parsed.overrides, [{ occurrence: "2025-01-06", date: "2025-01-07" }]);
+	const note = {
+		...ev({ uid: "cs1027", title: "CS1027", date: "2025-01-06", startTime: "12:30", endTime: "13:30",
+			location: undefined }),
+		recurrence: parsed.recurrence, exceptions: parsed.exceptions, overrides: parsed.overrides,
+	};
+	const r = patchICS(series, note, TO)!;
+	assert.equal(r.changed, false, "an unedited finished course must not be rewritten");
+});
+
+test("the master is found even when an override component comes first", () => {
+	const overrideFirst = WEDNESDAYS.replace(
+		"BEGIN:VEVENT",
+		`${MOVED_COMPONENT}\r\nBEGIN:VEVENT`
+	);
+	const r = patchICS(overrideFirst, wednesdays({ title: "Renamed", overrides: [{ ...MOVE }] }), TO)!;
+	const parsed = icsToEvent(r.ics, TO)!;
+	assert.equal(parsed.title, "Renamed");
+	assert.equal(parsed.date, "2026-02-11", "the override was edited as if it were the series");
+	assert.deepEqual(parsed.overrides, [MOVE]);
+});
+
+test("overrides that rewrite the rest of the series stay out of reach", () => {
+	for (const component of [
+		MOVED_COMPONENT.replace("RECURRENCE-ID;TZID", "RECURRENCE-ID;RANGE=THISANDFUTURE;TZID"),
+		MOVED_COMPONENT.replace("LOCATION:DC 1350", "LOCATION:DC 1350\r\nSTATUS:CANCELLED"),
+	]) {
+		const body = WEDNESDAYS.replace("END:VCALENDAR", `${component}\r\nEND:VCALENDAR`);
+		assert.equal(icsToEvent(body, TO)!.recurrence, undefined);
+		const r = patchICS(body, wednesdays({ title: "Renamed" }), TO)!;
+		assert.equal(r.pullOnly, true);
+		assert.equal(r.ics, body);
+	}
+});
+
+test("a brand new series is written with its overrides", () => {
+	const ics = eventToICS(
+		wednesdays({ overrides: [{ ...MOVE }, { occurrence: "2026-03-04", title: "Guest lecture" }] }),
+		TO
+	);
+	assert.equal(instances(ics).length, 2);
+	assert.deepEqual(icsToEvent(ics, TO)!.overrides, [
+		MOVE,
+		{ occurrence: "2026-03-04", title: "Guest lecture" },
+	]);
+});
+
+test("an all-day series names its occurrences by date", () => {
+	const ics = eventToICS(
+		ev({ allDay: true, startTime: undefined, endTime: undefined,
+			recurrence: { freq: "weekly", interval: 1, byDay: ["WE"] },
+			overrides: [{ occurrence: "2026-02-18", date: "2026-02-20" }] }),
+		TO
+	);
+	assert.match(ics, /RECURRENCE-ID;VALUE=DATE:20260218/);
+	assert.deepEqual(icsToEvent(ics, TO)!.overrides, [{ occurrence: "2026-02-18", date: "2026-02-20" }]);
+});
+
+test("a monthly positional series patches without touching its rule", () => {
+	const monthly = APPLE.replace("SEQUENCE:2", "SEQUENCE:2\r\nRRULE:FREQ=MONTHLY;BYDAY=WE;BYSETPOS=2");
+	const parsed = icsToEvent(monthly, TO)!;
+	assert.deepEqual(parsed.recurrence, { freq: "monthly", interval: 1, byDay: ["WE"], bySetPos: [2] });
+	const r = patchICS(monthly, series({ title: "Renamed", recurrence: parsed.recurrence }), TO)!;
+	assert.equal(r.changed, true);
+	assert.equal(r.pullOnly, false);
+	// Spelled the server's way, not ours: the rule was not edited, so it is
+	// not rewritten.
+	assert.ok(r.ics.includes("RRULE:FREQ=MONTHLY;BYDAY=WE;BYSETPOS=2"));
 });
 
 test("cancelling one occurrence writes an EXDATE and keeps the alarm", () => {
@@ -230,6 +454,21 @@ test("a weekly class keeps its hour across the spring clock change", () => {
 	assert.deepEqual([...hours], [10], "the series drifted at the clock change");
 });
 
+test("a series that starts before the spring change reads back at its own hour", () => {
+	// The generated VTIMEZONE used to begin at the year's first clock change,
+	// leaving the weeks before it undefined: an 18:00 class read back as 13:00,
+	// and a pull would have written that into the note. Other zones are
+	// covered in vtimezone.test.ts.
+	for (const date of ["2026-01-05", "2026-02-11", "2026-07-08", "2026-12-02"]) {
+		const parsed = icsToEvent(
+			eventToICS(series({ date, recurrence: { freq: "weekly", interval: 1 } }), TO),
+			TO
+		)!;
+		assert.equal(parsed.startTime, "18:00", `${date} came back at ${parsed.startTime}`);
+		assert.equal(parsed.endTime, "20:00");
+	}
+});
+
 test("a one-off event is still written as an unambiguous instant", () => {
 	const ics = eventToICS(ev(), TO);
 	assert.match(ics, /DTSTART:20260211T230000Z/);
@@ -271,4 +510,11 @@ test("a type mirror round-trips through an event with several types", () => {
 	const parsed = icsToEvent(ics, TO);
 	assert.deepEqual(parsed?.types, ["personal", "work"]);
 	assert.deepEqual(parsed?.props, { a: 1, b: 2 });
+});
+
+test("a locked event is refused by the patcher too, whatever the caller", () => {
+	const r = patchICS(APPLE, ev({ title: "Renamed", readOnly: true }), TO)!;
+	assert.equal(r.pullOnly, true);
+	assert.equal(r.changed, false);
+	assert.equal(r.ics, APPLE);
 });

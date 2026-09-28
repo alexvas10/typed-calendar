@@ -2,9 +2,10 @@
  * Live push verification, run outside Obsidian.
  *
  * Exercises the real write path -- PUT with If-None-Match / If-Match, the 412
- * guard, patch-in-place, move between calendars, RRULE + VTIMEZONE and EXDATE
- * -- against the user's actual iCloud account, using only throwaway events in
- * the empty Home calendar (and Work, for the move).
+ * guard, patch-in-place, move between calendars, RRULE + VTIMEZONE, EXDATE,
+ * a changed single occurrence (RECURRENCE-ID) and a "2nd Tuesday" monthly
+ * rule -- against the user's actual iCloud account, using only throwaway
+ * events in the empty Home calendar (and Work, for the move).
  *
  * Safety: every href in Home and Work is recorded before anything is written,
  * the script refuses to PUT or DELETE any href it did not create itself, and
@@ -18,6 +19,8 @@ import { readFileSync } from "node:fs";
 import ICAL from "ical.js";
 const { CalDavClient, CalDavError } = await import("../src/sync/caldav");
 const { eventToICS, icsToEvent, patchICS } = await import("../src/sync/ics");
+const { expandOccurrences, positionInMonth } = await import("../src/model/recurrence");
+const { utcToWallClock } = await import("../src/util/timezone");
 
 const cfg = JSON.parse(readFileSync("data.json", "utf8"));
 const client = new CalDavClient(cfg.caldav.serverUrl, cfg.caldav.username, cfg.caldav.password);
@@ -58,6 +61,7 @@ function guard(calUrl: string, href: string): void {
 const stamp = Date.now();
 const uid = `tc-pushtest-${stamp}`;
 const seriesUid = `tc-pushtest-series-${stamp}`;
+const monthlyUid = `tc-pushtest-monthly-${stamp}`;
 
 function iso(daysFromNow: number): string {
 	const d = new Date();
@@ -271,6 +275,129 @@ try {
 	const amnesiac = patchICS(sobj!.data, { ...series, recurrence: undefined }, TZ);
 	check("patchICS refuses", amnesiac?.pullOnly === true && amnesiac?.changed === false);
 	check("and returns the body untouched", amnesiac?.ics === sobj!.data);
+
+	// ------------------------------------------- 11. change ONE occurrence
+	/**
+	 * The occurrences Apple would show, overrides applied: each as
+	 * "YYYY-MM-DDTHH:MM" in the event's own zone, plus "@location" when it
+	 * has one. A moved occurrence is written as a UTC instant while the series
+	 * is wall-clock time, so a UTC start is converted before printing, or 14:00
+	 * in Toronto reads as 18:00. ical.js is an
+	 * independent RFC 5545 implementation, so agreeing with it is a real check
+	 * on the RECURRENCE-ID we wrote, not a check of our code against itself.
+	 */
+	const shown = (ics: string): string[] => {
+		const comp = new ICAL.Component(ICAL.parse(ics));
+		for (const vt of comp.getAllSubcomponents("vtimezone")) {
+			const zone = new ICAL.Timezone(vt);
+			if (!ICAL.TimezoneService.has(zone.tzid)) ICAL.TimezoneService.register(zone);
+		}
+		const vevents = comp.getAllSubcomponents("vevent");
+		const master = new ICAL.Event(vevents.find((v) => !v.hasProperty("recurrence-id")));
+		for (const v of vevents) if (v.hasProperty("recurrence-id")) master.relateException(v);
+		const it = master.iterator();
+		const out: string[] = [];
+		for (let next = it.next(); next && out.length < 20; next = it.next()) {
+			const details = master.getOccurrenceDetails(next);
+			const where = details.item.location ? `@${details.item.location}` : "";
+			const start = details.startDate;
+			const wall = start.zone?.tzid === "UTC"
+				? (({ date, time }) => `${date}T${time}`)(utcToWallClock(start.toJSDate().valueOf(), TZ))
+				: start.toString().slice(0, 16);
+			out.push(`${wall}${where}`);
+		}
+		return out.sort();
+	};
+
+	step("11. change one occurrence: move week 2 to Tuesday 14:00 in another room");
+	// Give the series an alarm first: a detached occurrence must carry it too,
+	// or the moved class would silently lose its reminder.
+	const withSeriesAlarm = sobj!.data.replace(
+		"END:VEVENT",
+		"BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT"
+	);
+	await client.put(seriesHref, withSeriesAlarm, sobj!.etag);
+	sobj = await fetchOne(HOME.url, seriesHref);
+
+	const week2 = addDays(monday, 7);
+	const move = { occurrence: week2, date: addDays(week2, 1), startTime: "14:00", endTime: "15:00", location: "Room B" };
+	const withMove = patchICS(sobj!.data, { ...series, overrides: [move] }, TZ);
+	check("patch adds the changed occurrence", withMove?.changed === true && !withMove.pullOnly);
+	await client.put(seriesHref, withMove!.ics, sobj!.etag);
+	sobj = await fetchOne(HOME.url, seriesHref);
+	check("still ONE resource in Home",
+		(await client.listResources(HOME.url)).length === baseline.get(HOME.url)!.size + 1);
+	check("server holds a RECURRENCE-ID component", /^RECURRENCE-ID/m.test(sobj!.data),
+		sobj!.data.match(/RECURRENCE-ID[^\r\n]*/)?.[0]);
+	check("the change reads back exactly",
+		JSON.stringify(icsToEvent(sobj!.data, TZ)?.overrides) === JSON.stringify([move]),
+		JSON.stringify(icsToEvent(sobj!.data, TZ)?.overrides));
+	const afterMove = shown(sobj!.data);
+	console.log(`     occurrences: ${afterMove.join("  ")}`);
+	check("four occurrences, one of them moved", afterMove.length === 4, String(afterMove.length));
+	check("week 2 is on Tuesday at 14:00 in Room B", afterMove.includes(`${addDays(week2, 1)}T14:00@Room B`));
+	check("week 2's Monday slot is empty", !afterMove.some((o) => o.startsWith(week2)));
+	check("the other weeks are untouched at 10:00",
+		afterMove.filter((o) => o.endsWith("T10:00")).length === 3);
+	const detached = new ICAL.Component(ICAL.parse(sobj!.data)).getAllSubcomponents("vevent")
+		.find((v) => v.hasProperty("recurrence-id"));
+	check("the moved occurrence carries the series' alarm", Boolean(detached?.getFirstSubcomponent("valarm")));
+
+	step("12. edit the changed occurrence: patched in place, then a no-op");
+	const renamed = { ...move, location: "Room C" };
+	const roomEdit = patchICS(sobj!.data, { ...series, overrides: [renamed] }, TZ);
+	check("patch changes only the room", roomEdit?.changed === true);
+	await client.put(seriesHref, roomEdit!.ics, sobj!.etag);
+	sobj = await fetchOne(HOME.url, seriesHref);
+	check("room is Room C on the server", shown(sobj!.data).includes(`${addDays(week2, 1)}T14:00@Room C`));
+	const settled = patchICS(sobj!.data, { ...series, overrides: [renamed] }, TZ);
+	check("an unchanged note now sends nothing", settled?.changed === false);
+
+	step("13. reset the occurrence to the series");
+	const reset = patchICS(sobj!.data, { ...series, overrides: undefined }, TZ);
+	check("patch removes the change", reset?.changed === true);
+	await client.put(seriesHref, reset!.ics, sobj!.etag);
+	sobj = await fetchOne(HOME.url, seriesHref);
+	check("no RECURRENCE-ID left", !/^RECURRENCE-ID/m.test(sobj!.data));
+	const afterReset = shown(sobj!.data);
+	check("four Mondays at 10:00 again",
+		afterReset.length === 4 && afterReset.every((o) => o.endsWith("T10:00")), afterReset.join(","));
+	check("the series alarm survived all of it", sobj!.data.includes("TRIGGER:-PT10M"));
+
+	// -------------------------------------------- 14. a "2nd Tuesday" series
+	step("14. monthly positional rule: the 2nd Tuesday, three times");
+	// The next second Tuesday strictly after today.
+	let first = addDays(iso(1), 0);
+	while (!(positionInMonth(first).day === "TU" && positionInMonth(first).nth === 2)) first = addDays(first, 1);
+	const monthly: any = {
+		...base,
+		uid: monthlyUid,
+		title: "Typed Calendar monthly test",
+		date: first,
+		startTime: "09:00",
+		endTime: "10:00",
+		location: undefined,
+		recurrence: { freq: "monthly", interval: 1, byNthDay: [{ nth: 2, day: "TU" }], count: 3 },
+	};
+	const monthlyHref = `${HOME.url}${monthlyUid}.ics`;
+	guard(HOME.url, monthlyHref);
+	await client.put(monthlyHref, eventToICS(monthly, TZ));
+	const mobj = await fetchOne(HOME.url, monthlyHref);
+	check("monthly resource exists", Boolean(mobj));
+	check("rule on the server is BYDAY=2TU",
+		/^RRULE:.*BYDAY=2TU/m.test(mobj!.data), mobj!.data.match(/^RRULE[^\r\n]*/m)?.[0]);
+	const mparsed = icsToEvent(mobj!.data, TZ);
+	check("rule reads back unchanged",
+		JSON.stringify(mparsed?.recurrence) === JSON.stringify(monthly.recurrence),
+		JSON.stringify(mparsed?.recurrence));
+	const theirs = shown(mobj!.data).map((o) => o.slice(0, 10));
+	const ours = expandOccurrences(first, monthly.recurrence, [], { from: first, to: addDays(first, 120) });
+	console.log(`     ical.js: ${theirs.join("  ")}`);
+	console.log(`     plugin:  ${ours.join("  ")}`);
+	check("the plugin and ical.js agree on every date", theirs.join(",") === ours.join(","));
+	check("every date is a Tuesday in the 2nd week",
+		theirs.every((d) => positionInMonth(d).day === "TU" && positionInMonth(d).nth === 2));
+	check("an unchanged note sends nothing", patchICS(mobj!.data, monthly, TZ)?.changed === false);
 } finally {
 	step("cleanup");
 	for (const href of Array.from(mine)) {

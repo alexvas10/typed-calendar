@@ -3,7 +3,7 @@
 An Obsidian calendar built around **typed events**: an event can carry several
 types at once, each type can declare its own custom fields, and undated events
 are first-class citizens rather than errors. Dated events sync two-way with
-iCloud Apple Calendar over CalDAV.
+iCloud Apple Calendar, Google Calendar and Outlook -- any or all of them.
 
 Built because no existing plugin covers this. *Full Calendar Remastered* does
 two-way iCloud sync well, but encodes categories as a title prefix
@@ -13,10 +13,26 @@ shipped in about three years and wants a raw Apple ID password.
 
 ## Views
 
-**Calendar** — month, week and agenda grids, with a filter chip per event type.
-Filters are OR: selecting `exam` and `assignment` shows both, so you can hide a
-crowded weekly class schedule and see only what is due. Repeating events are
+**Calendar** — year, month, week, day and agenda views. Repeating events are
 expanded into the visible range, so one note fills every week it covers.
+
+- **+ New event** in the toolbar, or click an empty day, or drag across time
+  slots in week/day view to create an event with those times filled in.
+- **Types** opens the type filter. Filters are OR: selecting `exam` and
+  `assignment` shows both, so you can hide a crowded class schedule and see
+  only what is due. The button is outlined while a filter is hiding events.
+- **Drag an event** to reschedule it; drag its bottom edge to change its end.
+  Dragging one occurrence of a repeating event moves **only that occurrence**.
+  Locked events cannot be dragged.
+- **Hover an event** for its time, types, room and important fields.
+- **Year view** shows twelve months with each event as a coloured bar; click a
+  day to open that month. **Click the title** to jump to any month of any year.
+- **"N awaiting dates"** appears when events have no date yet, and opens
+  Expecting soon.
+- The calendar reopens on the view and date you left it on.
+- Keys, while the calendar is focused: `←` `→` previous/next, `T` today,
+  `N` new event, `G` go to date, `Y` `M` `W` `D` `A` year, month, week, day,
+  agenda.
 
 **Priority** — what is coming, soonest first, annotated with the fields each
 type marked as important:
@@ -72,11 +88,44 @@ the calendar or the priority list and press **Skip this occurrence**; every
 other date is untouched, and the skip is pushed to iCloud as an `EXDATE` so the
 phone agrees. Skipped dates are listed in the editor with one click to restore.
 
-The supported rules are deliberately a subset: frequency, interval, weekly
-`BYDAY`, and either `until` or `count`. A series iCloud sends that falls outside
-it — "the second Tuesday of the month", `RDATE`, or per-occurrence overrides —
-is displayed but never written to. That asymmetry is the point: a rule the
-plugin cannot write back is a rule it cannot safely edit.
+**Monthly and yearly rules** can repeat on the same day of the month, or on a
+weekday's position in it. In the editor, **Repeat on** offers both, worked out
+from the start date: an event on 10 March 2026 can repeat "on day 10" or "on
+the 2nd Tuesday". In frontmatter a number in front of a weekday positions it:
+
+```yaml
+recurrence: { freq: monthly, byDay: [2TU] }               # 2nd Tuesday
+recurrence: { freq: monthly, byDay: [-1FR] }              # last Friday
+recurrence: { freq: monthly, byMonthDay: [1, 15] }        # the 1st and 15th
+recurrence: { freq: monthly, byDay: [MO, TU, WE, TH, FR], bySetPos: [-1] }  # last weekday
+recurrence: { freq: yearly, byMonth: [11], byDay: [4TH] } # 4th Thursday of November
+```
+
+**Changing one occurrence**: a lecture moved to Thursday for one week, or held
+in another room. Press **Change this occurrence** on it, or add an entry to
+`overrides`. `occurrence` is the date the rule puts it on, and anything left
+out follows the series, so renaming the course later still reaches it:
+
+```yaml
+overrides:
+  - occurrence: 2026-02-18   # the Wednesday lecture...
+    date: 2026-02-19         # ...is on Thursday this week
+    startTime: "14:00"
+    location: DC 1350
+```
+
+A changed occurrence is drawn with a dashed edge on the calendar and listed in
+the editor under **Changed occurrences**, with **Reset to series** to undo it.
+It syncs as a detached occurrence (a `RECURRENCE-ID` component), which is what
+Apple Calendar creates for "this event only", and it keeps the series' alarm.
+
+The supported rules are still a subset. They cover everything Apple
+Calendar's own repeat editor produces: weekdays, intervals, positions, month
+days, `until`/`count`. A series iCloud sends that falls outside them, such as
+`BYWEEKNO`, `BYYEARDAY`, `RDATE`, hourly rules, or an override applying to
+"this and all future events", is displayed but never written to. That
+asymmetry is the point: a rule the plugin cannot write back is a rule it
+cannot safely edit.
 
 ## iCloud sync
 
@@ -110,9 +159,16 @@ How it behaves:
   `X-` properties, so a pull that does not return them leaves the local values
   alone rather than clearing them. This is the one asymmetry in the sync.
 - **Deleted remotely?** The link is dropped and the note is kept, not deleted.
+- **Locking an event.** Add `readOnly: true` to a note to keep it exactly as
+  iCloud has it, for a finished course kept as a record, say. The plugin then
+  never writes, moves or deletes its iCloud copy, while the note still follows
+  the server. Remove the line to unlock it.
 - **Recurring events** are two-way, within the supported subset above. A rule
-  the plugin parsed is written back as a real `RRULE`, and cancelled
-  occurrences as `EXDATE`s. A series whose rule it could not parse is pulled,
+  the plugin parsed is written back as a real `RRULE`, cancelled occurrences
+  as `EXDATE`s, and changed occurrences as `RECURRENCE-ID` components edited
+  in place, so an alarm set on one occurrence in Apple Calendar survives. A
+  series an older version gave up on is read once more after upgrading, in
+  case it is now writable. A series whose rule it could not parse is pulled,
   shown, and never written — including never moved between calendars and never
   deleted. Removing a repeat altogether is also refused: from the server it
   looks the same as a note that never knew the event repeated, so it is done by
@@ -140,6 +196,92 @@ sits in plaintext in `.obsidian/plugins/typed-calendar/data.json`. That is why
 an app-specific password is required rather than your Apple ID password — it is
 scoped to this use and individually revocable.
 
+## Google Calendar and Outlook sync
+
+Settings → Google Calendar sync / Outlook sync. Any combination of iCloud,
+Google and Outlook can be connected at once.
+
+**How the three stay in step.** Your notes are the hub. Each service syncs
+against the notes on its own, never with another service directly, so an
+event pulled in from iCloud is copied to Google through its note, and an edit
+made on your phone in Google reaches iCloud the same way. Each note keeps one
+link per service (`icloud:`, `google:`, `outlook:`). A change usually crosses
+services in one sync; occasionally, when Obsidian has not yet re-read a note
+it just wrote, it takes the next one.
+
+Everything described for iCloud applies to each service: types map to one
+calendar per service (set in each type's details), routed by rank; last edit
+wins with the loser backed up to `.conflicts/`; repeating events, skipped
+dates and changed occurrences sync both ways; locked events are never
+written; undated and TBD events stay local. Connecting a service copies every
+event that routes to it, past ones included -- except locked events and
+series a service cannot express. Types and custom fields are stored in each
+service's private app data, which, unlike iCloud's, is not stripped.
+
+**When something is deleted in one calendar.** Settings → Sync → *When an
+event is deleted in one calendar*:
+
+- *Remove it from that calendar only* (the default): the note and the other
+  calendars keep it, and it is not sent back there. The event editor shows
+  "Not in Google" with a button to send it back.
+- *Delete it everywhere*: the note and every other copy are deleted too. An
+  event that merely moved to another calendar on the same service is
+  recognised and not deleted. Locked events are never deleted this way.
+
+Deleting from Obsidian always removes the event from every service.
+
+### Connecting Google (your own sign-in registration)
+
+Google requires an app registration for calendar access. For now you create
+your own; it is free and takes about five minutes.
+
+1. Open [console.cloud.google.com](https://console.cloud.google.com), create a
+   project, and in *APIs & Services → Library* enable the **Google Calendar
+   API**.
+2. *Google Auth Platform → Audience*: user type **External**, add your own
+   Google address as a test user, then **Publish app** so it is *In
+   production*. (A project left in *Testing* issues sign-ins that expire after
+   seven days.) It stays unverified, which is fine for your own use: at sign-in
+   Google warns about an unverified app; choose *Advanced → Go to …* to
+   continue, since the app is yours.
+3. *Clients → Create client*, type **Desktop app**. Copy the client ID and the
+   client secret into settings. (A desktop client's secret is not a real
+   secret; Google still requires it.)
+4. Press **Sign in**, approve in the browser, then **Discover calendars**,
+   enable the ones to sync, and check each type's Google calendar.
+
+Google-specific: *Out of office*, *Focus time* and *Working location* entries
+are left alone, since Google restricts editing them. Moves between calendars
+keep the event's identity, so reminders set on the phone survive.
+
+### Connecting Outlook (your own sign-in registration)
+
+1. Open [entra.microsoft.com](https://entra.microsoft.com) → *App
+   registrations → New registration*. Supported accounts: **Accounts in any
+   organizational directory and personal Microsoft accounts**. Redirect URI:
+   platform **Public client/native (mobile & desktop)**, value
+   `http://localhost`.
+2. *API permissions*: Microsoft Graph, delegated, **Calendars.ReadWrite** (and
+   the default User.Read).
+3. Copy the *Application (client) ID* into settings; Outlook needs no secret.
+4. **Sign in**, **Discover calendars**, enable, map types.
+
+Outlook-specific limits, all from Microsoft's API:
+
+- Repeat rules must fit Outlook's patterns: one day of the month, or one
+  weekday position (first to fourth, or last). "The 1st and 15th" or "the
+  fifth Friday" cannot be expressed, so such an event stays out of Outlook
+  rather than being flattened (the sync summary counts it as not supported).
+- A deleted occurrence cannot be restored through the API. Restoring a
+  skipped date in Obsidian does not bring it back in Outlook.
+- There is no move between calendars; a retyped event is created in the new
+  calendar and deleted from the old one, so reminders set in Outlook on that
+  event do not carry over.
+
+**Security note:** sign-in tokens sit in plaintext in `data.json` like the
+iCloud password (Obsidian does not encrypt plugin data). They can be revoked
+from the Google or Microsoft account's security page; *Sign out* forgets them.
+
 ## AI and agents
 
 **No AI runs inside this plugin,** and it is fully usable without one. Instead
@@ -163,7 +305,8 @@ what routes a "TBD" final exam into Expecting soon.
 
 There is also an optional scripted surface at
 `app.plugins.plugins["typed-calendar"].api` (`listEvents`, `listTypes`,
-`createEvent`, `updateEvent`, `sync`) for Templater or agents that prefer
+`createEvent`, `updateEvent`, `skipOccurrence`, `changeOccurrence`,
+`resetOccurrence`, `sync`) for Templater or agents that prefer
 calling code.
 
 ## Event format
@@ -185,6 +328,7 @@ props:
   weight: 45
 recurrence: { ... }        # repeat rule; omit for a one-off event
 exceptions: [2026-02-16]   # dates the series skips
+overrides: [ ... ]         # single occurrences that differ from the series
 icloud: { ... }            # plugin-managed sync bookkeeping; do not hand-edit
 ---
 ```
@@ -236,6 +380,6 @@ schedule.
 ## Status
 
 Desktop only. Not yet implemented: recurrence beyond the subset above
-(positional rules like "the last Friday", per-occurrence overrides), iCloud
+(`BYWEEKNO`, `BYYEARDAY`, `RDATE`, "this and future" edits), iCloud
 Reminders (Apple does not expose them as standard CalDAV VTODO), and per-event
 reminders/alarms.

@@ -39,7 +39,32 @@ export interface EventType {
 	 * is pushed to the calendar of its highest-ranked mapped type.
 	 */
 	icloudCalendar?: string;
+	/** Id of the Google calendar this type maps to, if any. Same rules as iCloud. */
+	googleCalendar?: string;
+	/** Id of the Outlook calendar this type maps to, if any. Same rules as iCloud. */
+	outlookCalendar?: string;
 }
+
+/**
+ * The calendar services an event can sync with. The vault is the hub: each
+ * service syncs against the notes on its own, so an event pulled from iCloud
+ * reaches Google through its note, never directly.
+ */
+export type ProviderKey = "icloud" | "google" | "outlook";
+export const PROVIDERS: readonly ProviderKey[] = ["icloud", "google", "outlook"];
+
+export const PROVIDER_LABELS: Record<ProviderKey, string> = {
+	icloud: "iCloud",
+	google: "Google",
+	outlook: "Outlook",
+};
+
+/** Which EventType field holds the calendar a type maps to on each service. */
+export const CALENDAR_FIELD: Record<ProviderKey, "icloudCalendar" | "googleCalendar" | "outlookCalendar"> = {
+	icloud: "icloudCalendar",
+	google: "googleCalendar",
+	outlook: "outlookCalendar",
+};
 
 export type EventStatus = "confirmed" | "tbd";
 
@@ -64,8 +89,47 @@ export interface ICloudMeta {
 	 * Set once a pull has read the server's rule and found it outside the
 	 * writable subset. Without it every sync would re-fetch the same series
 	 * hoping for a different answer.
+	 *
+	 * Holds the `RULE_READER_VERSION` that gave up on it. `true` is the
+	 * marker from before versions existed. A newer reader re-reads the
+	 * series once, since the rule may be one it has since learned to write.
 	 */
-	unsupportedRule?: boolean;
+	unsupportedRule?: boolean | number;
+	/**
+	 * The event was deleted on this service and, under the default deletion
+	 * setting, stays out of it: it is not sent there again. Carries no other
+	 * fields. Removing the key from the note sends it again.
+	 */
+	excluded?: boolean;
+}
+
+/**
+ * Sync bookkeeping for one service. Every service uses iCloud's shape, so the
+ * planner reads them all the same way: `collection` is the calendar (a CalDAV
+ * URL, or a Google/Outlook calendar id) and `href` the event within it (a
+ * resource URL, or an event id).
+ */
+export type SyncBinding = ICloudMeta;
+
+/**
+ * One occurrence of a series changed on its own -- a lecture moved to Thursday
+ * for one week, or held in a different room. Fields left out follow the
+ * series. In iCalendar this is a VEVENT with a RECURRENCE-ID.
+ */
+export interface OccurrenceOverride {
+	/**
+	 * The date the rule puts this occurrence on. It identifies the occurrence
+	 * and never changes, even when `date` moves it elsewhere.
+	 */
+	occurrence: string;
+	/** Where the occurrence actually happens, when it was moved. */
+	date?: string;
+	allDay?: boolean;
+	startTime?: string;
+	endTime?: string;
+	title?: string;
+	location?: string;
+	description?: string;
 }
 
 export interface CalendarEvent {
@@ -90,7 +154,21 @@ export interface CalendarEvent {
 	 * whatever time it would have started.
 	 */
 	exceptions?: string[];
+	/**
+	 * Occurrences changed individually. Only meaningful with `recurrence`;
+	 * an entry whose occurrence the rule does not produce is ignored.
+	 */
+	overrides?: OccurrenceOverride[];
+	/**
+	 * Locked: the plugin never writes, moves or deletes the iCloud copy. The
+	 * note still follows the server on pull. For records kept as they are --
+	 * a finished course -- where no edit made in the vault should reach the
+	 * real calendar.
+	 */
+	readOnly?: boolean;
 	icloud?: ICloudMeta;
+	google?: SyncBinding;
+	outlook?: SyncBinding;
 	/** Vault path of the note backing this event. */
 	path: string;
 }
@@ -113,5 +191,15 @@ export function isScheduled(event: CalendarEvent): boolean {
  * calendar lost its alarms and recurrence rules once already.
  */
 export function isPullOnlySeries(event: CalendarEvent): boolean {
-	return Boolean(event.icloud?.recurring) && !event.recurrence;
+	// Any one service is enough. A series the note cannot express must not be
+	// copied anywhere else either: the copy would be a single, flattened event.
+	return !event.recurrence && PROVIDERS.some((key) => Boolean(event[key]?.recurring));
+}
+
+/**
+ * True when nothing may be written to the server for this event: either the
+ * user locked it, or the server repeats it in a way the note cannot express.
+ */
+export function isLocked(event: CalendarEvent): boolean {
+	return event.readOnly === true || isPullOnlySeries(event);
 }

@@ -1,26 +1,33 @@
-import { App, Notice, TFile, normalizePath } from "obsidian";
-import { CalDavClient, CalDavError } from "./caldav";
+import { App, Notice } from "obsidian";
+import { CalDavClient } from "./caldav";
 import { eventToICS, icsToEvent, ParsedVEvent, patchICS } from "./ics";
-import { mergeRemote, planSync, resourcesNeedingFetch, SyncAction } from "./plan";
+import {
+	mergeRemote,
+	newEventFromRemote,
+	planSync,
+	resourcesNeedingFetch,
+	SyncAction,
+	unsupportedMarker,
+} from "./plan";
 import { CalendarRouter } from "./routing";
-import { CalendarEvent } from "../model/types";
+import { CalendarEvent, ProviderKey, isLocked } from "../model/types";
 import { generateUid } from "../model/serialize";
 import { writeEventNote } from "../index/writer";
+import {
+	backfillTypes,
+	backupConflict,
+	dropLink,
+	excludeLink,
+	hasUnpushedEdits,
+	realignLink,
+	stampLink,
+	uidsOnDisk,
+} from "./notes";
+import { ProviderEngine } from "./ProviderEngine";
+import { RunContext, SyncReport, emptyReport, isWrite, newRunContext } from "./run";
 import type TypedCalendarPlugin from "../../main";
 
-export interface SyncReport {
-	pulled: number;
-	pushed: number;
-	deleted: number;
-	moved: number;
-	/** Events given their calendar's type. A local edit only; nothing is sent. */
-	typed: number;
-	/** Planned pushes that matched the server copy and sent nothing. */
-	unchanged: number;
-	unlinked: number;
-	conflicts: number;
-	errors: string[];
-}
+export type { SyncReport } from "./run";
 
 const MULTIGET_BATCH = 50;
 
@@ -45,48 +52,58 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Runs a full pass over every enabled calendar. Errors are collected per
-	 * calendar rather than thrown, so one unreachable collection does not
-	 * abandon the others.
+	 * Runs a full pass over every enabled calendar on every connected service:
+	 * iCloud first, then Google, then Outlook. Errors are collected per
+	 * calendar rather than thrown, so one unreachable calendar does not abandon
+	 * the others.
+	 *
+	 * The services never talk to each other. Each syncs against the notes, so a
+	 * change pulled from iCloud reaches Google through its note -- on this run
+	 * when the index has caught up, else on the next.
 	 */
 	async run(notify = true): Promise<SyncReport> {
-		const report: SyncReport = {
-			pulled: 0, pushed: 0, deleted: 0, moved: 0, typed: 0, unchanged: 0, unlinked: 0, conflicts: 0, errors: [],
-		};
+		const report = emptyReport();
 		if (this.running) {
 			report.errors.push("A sync is already in progress.");
 			return report;
 		}
 
-		const enabled = this.plugin.settings.caldav.calendars.filter((c) => c.enabled);
-		if (enabled.length === 0) {
+		const { caldav } = this.plugin.settings;
+		const icloud = caldav.username && caldav.password ? caldav.calendars.filter((c) => c.enabled) : [];
+		const remotes = this.plugin.remoteProviders();
+		if (icloud.length === 0 && remotes.length === 0) {
 			report.errors.push("No calendars are enabled for sync.");
 			if (notify) new Notice("Typed Calendar: no calendars enabled for sync.");
 			return report;
 		}
 
 		this.running = true;
+		const ctx = newRunContext(this.plugin.settings.deleteMode);
 		try {
-			const client = this.client();
-			const router = new CalendarRouter(
-				this.plugin.settings.eventTypes,
-				this.plugin.settings.caldav.fallbackCalendar
-			);
-			// Uids written during this run. The index is fed by metadataCache,
-			// which updates asynchronously, so a stamp written while syncing one
-			// calendar is not visible when the next one is planned.
-			const claimed = new Set<string>();
-			for (const calendar of enabled) {
-				try {
-					await this.syncCalendar(
-						client, calendar.url, calendar.readOnly, router, report, claimed
-					);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					report.errors.push(`${calendar.displayName}: ${message}`);
-					console.error("Typed Calendar: sync failed", calendar.url, error);
+			if (icloud.length > 0) {
+				const client = this.client();
+				const router = new CalendarRouter(this.plugin.settings.eventTypes, caldav.fallbackCalendar);
+				// Uids written during this run. The index is fed by metadataCache,
+				// which updates asynchronously, so a stamp written while syncing one
+				// calendar is not visible when the next one is planned.
+				const claimed = new Set<string>();
+				for (const calendar of icloud) {
+					try {
+						await this.syncCalendar(client, calendar.url, calendar.readOnly, router, report, claimed, ctx);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						report.errors.push(`iCloud · ${calendar.displayName}: ${message}`);
+						console.error("Typed Calendar: sync failed", calendar.url, error);
+					}
 				}
 			}
+			for (const provider of remotes) {
+				const engine = new ProviderEngine(this.app, this.plugin, provider, ctx, (event, r) =>
+					this.onVanished(event, provider.key, ctx, r)
+				);
+				await engine.run(report);
+			}
+			await this.resolveVanished(ctx, report);
 			this.plugin.settings.caldav.lastSync = new Date().toISOString();
 			await this.plugin.saveSettings();
 		} finally {
@@ -97,13 +114,54 @@ export class SyncEngine {
 		return report;
 	}
 
+	/**
+	 * An event is gone from a calendar it was linked to -- deleted on a phone,
+	 * or in the service's own app. Under the default setting it leaves that
+	 * service only and is not sent back; under "delete everywhere" it is
+	 * queued, and decided once the whole run has seen where it might have gone.
+	 * A locked event is never deleted this way, only kept out.
+	 */
+	private async onVanished(event: CalendarEvent, key: ProviderKey, ctx: RunContext, report: SyncReport): Promise<void> {
+		if (ctx.deleteMode === "this-calendar" || isLocked(event)) {
+			await excludeLink(this.app, event, key);
+			report.unlinked++;
+			return;
+		}
+		ctx.vanished.push({ event, key });
+	}
+
+	/**
+	 * Carries out "delete everywhere" for events that went missing this run. One
+	 * that turned up in another calendar on the same service was moved, not
+	 * deleted: its dead link is dropped so that calendar's next pass adopts it.
+	 */
+	private async resolveVanished(ctx: RunContext, report: SyncReport): Promise<void> {
+		for (const { event, key } of ctx.vanished) {
+			try {
+				if (ctx.seen[key].has(event.uid)) {
+					await dropLink(this.app, event, key);
+					report.unlinked++;
+					continue;
+				}
+				await this.plugin.deleteEverywhere(event, key);
+				report.deleted++;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				report.errors.push(`Deleting "${event.title}" everywhere: ${message}`);
+				// Whatever else failed, it stays out of the service it left.
+				await excludeLink(this.app, event, key);
+			}
+		}
+	}
+
 	private async syncCalendar(
 		client: CalDavClient,
 		calendarUrl: string,
 		readOnly: boolean,
 		router: CalendarRouter,
 		report: SyncReport,
-		claimed: Set<string>
+		claimed: Set<string>,
+		ctx: RunContext
 	): Promise<void> {
 		// Events bound elsewhere are filtered out by the planner; unbound ones
 		// are candidates only if they route here, which the planner decides.
@@ -113,7 +171,7 @@ export class SyncEngine {
 		);
 		// Every uid in the vault, so a resource whose note is bound to another
 		// calendar is never adopted as a second note for the same event.
-		const knownUids = this.uidsOnDisk();
+		const knownUids = uidsOnDisk(this.app);
 		for (const event of all) if (event.uid) knownUids.add(event.uid);
 		for (const uid of claimed) knownUids.add(uid);
 
@@ -126,9 +184,10 @@ export class SyncEngine {
 			const batch = stale.slice(i, i + MULTIGET_BATCH);
 			for (const object of await client.multiget(calendarUrl, batch)) {
 				const parsed = icsToEvent(object.data, timezone);
-				// Recurring series are rendered from the server copy but not
-				// authored here yet, so they are pulled and never pushed back.
-				if (parsed) fetched.set(object.href, parsed);
+				if (parsed) {
+					fetched.set(object.href, parsed);
+					ctx.seen.icloud.add(parsed.uid);
+				}
 			}
 		}
 
@@ -147,65 +206,49 @@ export class SyncEngine {
 			// still leaves the resource written, and a later pass in the same run
 			// must not treat it as a new event.
 			if ("event" in action && action.event.uid) claimed.add(action.event.uid);
-			await this.execute(client, calendarUrl, action, router, report);
+			await this.execute(client, calendarUrl, action, router, report, ctx);
 		}
 
-		await this.backfillTypes(calendarUrl, router, report, claimed);
+		report.typed += await backfillTypes(this.app, this.plugin.index.all(), "icloud", calendarUrl, router, claimed);
 	}
 
-	/**
-	 * Every uid written in a note, read from the file list rather than from the
-	 * index.
-	 *
-	 * Deliberately a second source: the index drops its entry for the old path
-	 * the instant a file is renamed, so for a moment an event exists on disk but
-	 * not in the map -- and a resource whose note is "missing" gets adopted as a
-	 * brand new event. Scanning files finds it under whichever path the cache
-	 * still knows.
-	 */
-	private uidsOnDisk(): Set<string> {
-		const uids = new Set<string>();
-		for (const file of this.app.vault.getMarkdownFiles()) {
-			const uid = this.app.metadataCache.getFileCache(file)?.frontmatter?.uid;
-			if (typeof uid === "string" && uid) uids.add(uid);
-		}
-		return uids;
-	}
 
 	private async execute(
 		client: CalDavClient,
 		calendarUrl: string,
 		action: SyncAction,
 		router: CalendarRouter,
-		report: SyncReport
+		report: SyncReport,
+		ctx: RunContext
 	): Promise<void> {
+		const folder = this.plugin.settings.eventFolder;
 		switch (action.kind) {
 			case "create-local": {
-				const event = this.eventFromRemote(
-					action.remote, action.href, action.etag, calendarUrl, router
+				const event = newEventFromRemote(
+					action.remote, "icloud", action.href, action.etag, calendarUrl,
+					(existing) => router.withCalendarType(existing, calendarUrl),
+					this.plugin.settings.defaultTimezone, action.remote.uid || generateUid()
 				);
-				const created = await writeEventNote(
-					this.app, this.plugin.settings.eventFolder, event, true
-				);
+				const created = await writeEventNote(this.app, folder, event, true);
 				// writeEventNote stamps localModified as "now", which would look
 				// like a local edit on the next pass; realign it to the remote.
-				await this.realign(created, action.remote.remoteModified);
+				await realignLink(this.app, created, "icloud", action.remote.remoteModified);
 				report.pulled++;
 				break;
 			}
 			case "update-local": {
-				if (hasUnpushedEdits(action.event)) {
-					await this.backupConflict(action.event);
+				if (hasUnpushedEdits(action.event.icloud)) {
+					await backupConflict(this.app, folder, action.event);
 					report.conflicts++;
 				}
 				const merged = mergeRemote(
 					action.event, action.remote, action.href, action.etag, calendarUrl,
 					(existing) => router.withCalendarType(existing, calendarUrl)
 				);
-				const updated = await writeEventNote(
-					this.app, this.plugin.settings.eventFolder, merged, false
-				);
-				await this.realign(updated, action.remote.remoteModified);
+				// Rewriting the note marks the Google and Outlook copies stale, which
+				// is how this change reaches them on their passes.
+				const updated = await writeEventNote(this.app, folder, merged, false);
+				await realignLink(this.app, updated, "icloud", action.remote.remoteModified);
 				report.pulled++;
 				break;
 			}
@@ -222,7 +265,7 @@ export class SyncEngine {
 			case "delete-remote": {
 				const href = action.event.icloud?.href;
 				if (href) await client.delete(href, action.event.icloud?.etag);
-				await this.unlink(action.event);
+				await dropLink(this.app, action.event, "icloud");
 				report.deleted++;
 				break;
 			}
@@ -245,7 +288,7 @@ export class SyncEngine {
 					// between its delete and its create. There is nothing left to
 					// carry, so drop the dead link and let the next pass create the
 					// event in the calendar it now routes to.
-					await this.unlink(action.event);
+					await dropLink(this.app, action.event, "icloud");
 					report.unlinked++;
 					break;
 				}
@@ -267,15 +310,15 @@ export class SyncEngine {
 					// the note stops pointing at a resource that no longer exists
 					// and is simply created again next pass; the note itself, which
 					// is what the user wrote, is never touched.
-					await this.unlink(action.event);
+					await dropLink(this.app, action.event, "icloud");
 					throw error;
 				}
 				report.moved++;
 				break;
 			}
 			case "unlink-local": {
-				await this.unlink(action.event);
-				report.unlinked++;
+				// Gone from iCloud: the deletion setting decides what that means.
+				await this.onVanished(action.event, "icloud", ctx, report);
 				break;
 			}
 		}
@@ -295,38 +338,6 @@ export class SyncEngine {
 	 * Returns whether anything was actually written: a planned update can turn
 	 * out to be a no-op once compared against the server copy.
 	 */
-	/**
-	 * Gives events already in the vault the type of the calendar they belong
-	 * to. Pulling only types an event when it is downloaded, so without this a
-	 * mapping made after the first sync would never reach existing events.
-	 *
-	 * Edits `types` alone and leaves the sync stamps untouched, so it is
-	 * invisible to the planner and cannot cause a push.
-	 */
-	private async backfillTypes(
-		calendarUrl: string,
-		router: CalendarRouter,
-		report: SyncReport,
-		claimed: Set<string>
-	): Promise<void> {
-		for (const event of this.plugin.index.all()) {
-			if (event.icloud?.collection !== calendarUrl) continue;
-			// This run already wrote this event somewhere, so the binding in the
-			// index is not necessarily current. An event that has just been moved
-			// out still reads as belonging here, and typing it would hand back the
-			// very type the user removed to move it in the first place.
-			if (claimed.has(event.uid)) continue;
-			const next = router.withCalendarType(event.types, calendarUrl);
-			if (next === event.types) continue;
-
-			const file = this.app.vault.getAbstractFileByPath(event.path);
-			if (!(file instanceof TFile)) continue;
-			await this.app.fileManager.processFrontMatter(file, (fm) => {
-				fm.types = next;
-			});
-			report.typed++;
-		}
-	}
 
 	private async push(
 		client: CalDavClient,
@@ -356,7 +367,7 @@ export class SyncEngine {
 			// Nothing to send. Record the server's state so the next pass does
 			// not see a stale ETag and revisit it.
 			const parsed = icsToEvent(current.data, timezone);
-			await this.stampSync(event, {
+			await stampLink(this.app, event, "icloud", {
 				href,
 				etag: current.etag,
 				remoteModified: parsed?.remoteModified,
@@ -382,149 +393,17 @@ export class SyncEngine {
 	): Promise<void> {
 		const [written] = await client.multiget(calendarUrl, [href]);
 		const parsed = written ? icsToEvent(written.data, this.plugin.settings.defaultTimezone) : null;
-		await this.stampSync(event, {
+		await stampLink(this.app, event, "icloud", {
 			href,
 			etag: written?.etag ?? "",
 			remoteModified: parsed?.remoteModified,
 			collection: calendarUrl,
 			recurring: parsed?.recurring,
-			unsupportedRule: parsed ? parsed.recurring && !parsed.recurrence : undefined,
+			unsupportedRule: unsupportedMarker(parsed),
 		});
-	}
-
-	private eventFromRemote(
-		remote: ParsedVEvent,
-		href: string,
-		etag: string,
-		calendarUrl: string,
-		router: CalendarRouter
-	): CalendarEvent {
-		return {
-			uid: remote.uid || generateUid(),
-			title: remote.title,
-			// A pulled event carries no types of its own, so the calendar it
-			// came from supplies one.
-			types: router.withCalendarType(remote.types ?? [], calendarUrl),
-			date: remote.date,
-			recurrence: remote.recurrence,
-			exceptions: remote.recurrence ? remote.exceptions : undefined,
-			startTime: remote.startTime,
-			endTime: remote.endTime,
-			allDay: remote.allDay,
-			location: remote.location,
-			description: remote.description,
-			timezone: this.plugin.settings.defaultTimezone,
-			status: "confirmed",
-			props: remote.props ?? {},
-			icloud: {
-				collection: calendarUrl,
-				href,
-				etag,
-				remoteModified: remote.remoteModified,
-				localModified: remote.remoteModified,
-				recurring: remote.recurring || undefined,
-				unsupportedRule: remote.recurring && !remote.recurrence ? true : undefined,
-			},
-			path: "",
-		};
-	}
-
-	/** Writes sync bookkeeping onto the note without touching its content. */
-	private async stampSync(
-		event: CalendarEvent,
-		meta: {
-			href: string;
-			etag: string;
-			remoteModified?: string;
-			collection?: string;
-			recurring?: boolean;
-			unsupportedRule?: boolean;
-		}
-	): Promise<void> {
-		const file = this.app.vault.getAbstractFileByPath(event.path);
-		if (!(file instanceof TFile)) return;
-		const stamp = meta.remoteModified ?? new Date().toISOString();
-		await this.app.fileManager.processFrontMatter(file, (fm) => {
-			const icloud: Record<string, unknown> = {
-				...(fm.icloud as object),
-				collection: meta.collection ?? event.icloud?.collection,
-				href: meta.href,
-				etag: meta.etag,
-				remoteModified: stamp,
-				localModified: stamp,
-				recurring: meta.recurring || undefined,
-				unsupportedRule: meta.unsupportedRule || undefined,
-			};
-			// A key set to undefined would serialise as an empty YAML value
-			// rather than disappearing, and an empty `recurring:` reads as
-			// truthy nowhere but looks alarming in the note.
-			for (const [key, value] of Object.entries(icloud)) {
-				if (value === undefined) delete icloud[key];
-			}
-			fm.icloud = icloud;
-		});
-	}
-
-	/**
-	 * Realigns the local stamp to the remote one after a pull, so the next
-	 * pass does not mistake the write we just made for a user edit.
-	 *
-	 * Takes the file writeEventNote returned rather than looking it up: a
-	 * freshly created note is not in the index yet, because metadataCache
-	 * updates asynchronously, and the lookup would silently find nothing.
-	 */
-	private async realign(file: TFile, remoteModified?: string): Promise<void> {
-		const stamp = remoteModified ?? new Date().toISOString();
-		await this.app.fileManager.processFrontMatter(file, (fm) => {
-			fm.icloud = { ...(fm.icloud as object), remoteModified: stamp, localModified: stamp };
-		});
-	}
-
-	/** Drops the server link, leaving the note itself untouched. */
-	private async unlink(event: CalendarEvent): Promise<void> {
-		const file = this.app.vault.getAbstractFileByPath(event.path);
-		if (!(file instanceof TFile)) return;
-		await this.app.fileManager.processFrontMatter(file, (fm) => {
-			delete fm.icloud;
-		});
-	}
-
-	/**
-	 * Copies the about-to-be-overwritten local version into a conflicts
-	 * folder. Last-edit-wins is only safe if the loser is recoverable.
-	 */
-	private async backupConflict(event: CalendarEvent): Promise<void> {
-		const file = this.app.vault.getAbstractFileByPath(event.path);
-		if (!(file instanceof TFile)) return;
-		const folder = normalizePath(`${this.plugin.settings.eventFolder}/.conflicts`);
-		try {
-			if (!this.app.vault.getAbstractFileByPath(folder)) {
-				await this.app.vault.createFolder(folder);
-			}
-			const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-			const contents = await this.app.vault.read(file);
-			await this.app.vault.create(`${folder}/${file.basename} ${stamp}.md`, contents);
-		} catch (error) {
-			console.error("Typed Calendar: could not back up conflicting event", error);
-		}
 	}
 }
 
-function isWrite(action: SyncAction): boolean {
-	return (
-		action.kind === "create-remote" ||
-		action.kind === "update-remote" ||
-		action.kind === "delete-remote"
-	);
-}
-
-/** True when the note changed after the last successful push. */
-function hasUnpushedEdits(event: CalendarEvent): boolean {
-	const local = Date.parse(event.icloud?.localModified ?? "");
-	const remote = Date.parse(event.icloud?.remoteModified ?? "");
-	if (isNaN(local) || isNaN(remote)) return false;
-	return local > remote;
-}
 
 function describe(report: SyncReport): string {
 	if (report.errors.length > 0) {
@@ -539,6 +418,7 @@ function describe(report: SyncReport): string {
 	if (report.unchanged) parts.push(`${report.unchanged} already current`);
 	if (report.unlinked) parts.push(`${report.unlinked} unlinked`);
 	if (report.conflicts) parts.push(`${report.conflicts} conflict(s) backed up`);
+	if (report.skipped) parts.push(`${report.skipped} not supported by a service`);
 	return parts.length > 0
 		? `Typed Calendar: synced (${parts.join(", ")}).`
 		: "Typed Calendar: already up to date.";
