@@ -19,6 +19,7 @@ export const MANAGED_KEYS = [
 	"exceptions",
 	"overrides",
 	"readOnly",
+	"done",
 	"icloud",
 	"google",
 	"outlook",
@@ -108,6 +109,7 @@ export function parseOverrides(value: unknown): OccurrenceOverride[] {
 			const text = asString(raw[key]);
 			if (text) override[key] = text;
 		}
+		if (raw.done === true) override.done = true;
 		byOccurrence.set(occurrence, override);
 	}
 	return Array.from(byOccurrence.values()).sort((a, b) =>
@@ -118,7 +120,7 @@ export function parseOverrides(value: unknown): OccurrenceOverride[] {
 /** The `overrides` value to write back, in a stable key order. */
 export function overridesToFrontmatter(overrides: OccurrenceOverride[]): Record<string, unknown>[] {
 	const keys = [
-		"occurrence", "date", "allDay", "startTime", "endTime", "title", "location", "description",
+		"occurrence", "date", "allDay", "startTime", "endTime", "title", "location", "description", "done",
 	] as const;
 	return [...overrides]
 		.sort((a, b) => a.occurrence.localeCompare(b.occurrence))
@@ -181,6 +183,8 @@ export function eventFromFrontmatter(
 		// Only a literal `true` locks: a typo must not silently unlock, but it
 		// must not silently lock something either.
 		readOnly: frontmatter.readOnly === true ? true : undefined,
+		// Like readOnly, only a literal `true`.
+		done: frontmatter.done === true ? true : undefined,
 		icloud: frontmatter.icloud ? (asRecord(frontmatter.icloud) as ICloudMeta) : undefined,
 		google: frontmatter.google ? (asRecord(frontmatter.google) as ICloudMeta) : undefined,
 		outlook: frontmatter.outlook ? (asRecord(frontmatter.outlook) as ICloudMeta) : undefined,
@@ -231,6 +235,7 @@ export function applyEventToFrontmatter(
 			: undefined
 	);
 	set("readOnly", event.readOnly ? true : undefined);
+	set("done", event.done ? true : undefined);
 	for (const key of ["icloud", "google", "outlook"] as const) {
 		const binding = event[key];
 		set(key, binding && Object.keys(binding).length > 0 ? binding : undefined);

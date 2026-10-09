@@ -149,6 +149,15 @@ export class EventModal extends Modal {
 		this.renderRepeat();
 
 		new Setting(contentEl)
+			.setName("Done")
+			.setDesc("Crossed off: hidden from the calendar and lists (unless Show completed is on), kept in the vault, and marked with a check on synced calendars.")
+			.addToggle((toggle) =>
+				toggle.setValue(Boolean(this.draft.done)).onChange((value) => {
+					this.draft.done = value ? true : undefined;
+				})
+			);
+
+		new Setting(contentEl)
 			.setName("Awaiting details")
 			.setDesc("Keeps the event out of the calendar and out of every synced calendar, even if it has a date.")
 			.addToggle((toggle) =>

@@ -72,6 +72,8 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 					.then((text) => this.commitOnFinish(text.inputEl))
 			);
 
+		this.renderExtraFolders(containerEl);
+
 		new Setting(containerEl)
 			.setName("Priority horizon")
 			.setDesc("How many days ahead the priority view looks.")
@@ -425,6 +427,26 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 		const { caldav } = this.plugin.settings;
 		new Setting(containerEl).setName("Sync").setHeading();
 
+		// Only one computer syncs a shared vault; see sync/device.ts.
+		const chosen = this.plugin.settings.syncDevice;
+		const here = this.plugin.deviceId();
+		const onHere = Boolean(chosen?.id) && chosen?.id === here;
+		new Setting(containerEl)
+			.setName("Sync from this computer")
+			.setDesc(
+				onHere
+					? "This computer syncs with iCloud, Google and Outlook. If the vault is shared with other computers, they see the events through it but do not sync themselves."
+					: chosen?.id
+						? `${chosen.name || "Another computer"} syncs with the calendar services, not this one. Turning this on moves syncing here and stops it there.`
+						: "No computer syncs with the calendar services right now. Turn this on to sync from this one."
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(onHere).onChange(async (value) => {
+					await this.plugin.setSyncOnThisDevice(value);
+					this.display();
+				})
+			);
+
 		new Setting(containerEl)
 			.setName("When an event is deleted in one calendar")
 			.setDesc(
@@ -726,6 +748,45 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 						})
 				);
 		}
+	}
+
+	/**
+	 * Folders read and synced besides the event folder. Another plugin can
+	 * add one through the API (a class organiser's course folder); removing
+	 * it here stops the calendar reading it, and nothing in it is deleted.
+	 */
+	private renderExtraFolders(containerEl: HTMLElement): void {
+		const settings = this.plugin.settings;
+		new Setting(containerEl)
+			.setName("Also read events from")
+			.setDesc("Event notes in these folders are shown and synced too. New events from a synced calendar still go into the event folder; notes here stay where they are when edited.");
+		for (const folder of settings.extraEventFolders) {
+			new Setting(containerEl)
+				.setClass("tc-setting-indent")
+				.setName(folder)
+				.addExtraButton((button) =>
+					button
+						.setIcon("x")
+						.setTooltip("Stop reading this folder (its notes are kept)")
+						.onClick(async () => {
+							settings.extraEventFolders = settings.extraEventFolders.filter((f) => f !== folder);
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+		}
+		let pending = "";
+		new Setting(containerEl)
+			.setClass("tc-setting-indent")
+			.addText((text) => text.setPlaceholder("Courses").onChange((value) => (pending = value)))
+			.addButton((button) =>
+				button.setButtonText("Add folder").onClick(async () => {
+					const folder = pending.trim().replace(/^\/+|\/+$/g, "");
+					if (!folder) return;
+					await this.plugin.addEventFolder(folder);
+					this.display();
+				})
+			);
 	}
 }
 

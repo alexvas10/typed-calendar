@@ -1,4 +1,5 @@
-import { EventType } from "../model/types";
+import { SyncDevice, normalizeSyncDevice } from "../sync/device";
+import { EventType, TypeField } from "../model/types";
 import type { OAuthTokens } from "../sync/oauth";
 import { DEFAULT_EVENT_TYPES } from "../model/defaults";
 
@@ -60,8 +61,17 @@ export interface OAuthServiceSettings {
 export type DeleteMode = "this-calendar" | "everywhere";
 
 export interface TypedCalendarSettings {
-	/** Folder scanned for event notes. Notes elsewhere are ignored. */
+	/** Folder scanned for event notes, and where new ones are written. */
 	eventFolder: string;
+	/**
+	 * More folders whose event notes are indexed and synced -- added by the
+	 * user, or by another plugin through the API (a class organiser keeping
+	 * each course's assessments in the course's folder). New events pulled
+	 * from a server still land in `eventFolder`.
+	 */
+	extraEventFolders: string[];
+	/** Show crossed-off (`done`) events in the calendar and lists. */
+	showCompleted: boolean;
 	eventTypes: EventType[];
 	/** Type ids currently visible; empty means "show everything". */
 	activeFilters: string[];
@@ -75,6 +85,12 @@ export interface TypedCalendarSettings {
 	google: OAuthServiceSettings;
 	outlook: OAuthServiceSettings;
 	deleteMode: DeleteMode;
+	/**
+	 * The one computer that syncs with calendar services (see sync/device.ts).
+	 * Absent: not decided yet, and the first computer with a connected service
+	 * takes it.
+	 */
+	syncDevice?: SyncDevice;
 }
 
 export const DEFAULT_CALDAV: CalDavSettings = {
@@ -98,6 +114,8 @@ export const DEFAULT_OAUTH_SERVICE: OAuthServiceSettings = {
 
 export const DEFAULT_SETTINGS: TypedCalendarSettings = {
 	eventFolder: "Calendar/Events",
+	extraEventFolders: [],
+	showCompleted: false,
 	eventTypes: DEFAULT_EVENT_TYPES,
 	activeFilters: [],
 	priorityHorizonDays: 30,
@@ -124,6 +142,8 @@ export function normalizeSettings(stored: unknown): TypedCalendarSettings {
 		eventFolder: typeof raw.eventFolder === "string" && raw.eventFolder.trim()
 			? raw.eventFolder.replace(/^\/+|\/+$/g, "")
 			: DEFAULT_SETTINGS.eventFolder,
+		extraEventFolders: normalizeFolderList(raw.extraEventFolders),
+		showCompleted: raw.showCompleted === true,
 		eventTypes: types,
 		activeFilters: Array.isArray(raw.activeFilters) ? raw.activeFilters : [],
 		priorityHorizonDays: typeof raw.priorityHorizonDays === "number" && raw.priorityHorizonDays > 0
@@ -137,6 +157,7 @@ export function normalizeSettings(stored: unknown): TypedCalendarSettings {
 		google: normalizeOAuthService(raw.google),
 		outlook: normalizeOAuthService(raw.outlook),
 		deleteMode: raw.deleteMode === "everywhere" ? "everywhere" : "this-calendar",
+		syncDevice: normalizeSyncDevice(raw.syncDevice),
 	};
 }
 
@@ -198,4 +219,45 @@ export function uniqueTypeId(label: string, existing: EventType[]): string {
 		if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
 	}
 	throw new Error(`Could not find a free id for "${label}".`);
+}
+
+/**
+ * A type with any of `fields` it lacks appended, for plugins that build on
+ * the calendar and need a field to appear in the event editor.
+ *
+ * Only adds: a key the type already has is left exactly as the user set it
+ * up, whatever the incoming definition says. Returns the type itself when
+ * nothing is missing, so callers can skip the save.
+ */
+export function mergeTypeFields(type: EventType, fields: TypeField[]): EventType {
+	const keys = new Set(type.fields.map((field) => field.key));
+	const added: TypeField[] = [];
+	for (const field of fields) {
+		const key = field.key?.trim();
+		if (!key || keys.has(key)) continue;
+		keys.add(key);
+		added.push({ ...field, key });
+	}
+	return added.length > 0 ? { ...type, fields: [...type.fields, ...added] } : type;
+}
+
+/** Folder names without slashes at either end, no blanks, no repeats. */
+export function normalizeFolderList(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	const out: string[] = [];
+	for (const entry of value) {
+		if (typeof entry !== "string") continue;
+		const folder = entry.trim().replace(/^\/+|\/+$/g, "");
+		if (folder && !out.includes(folder)) out.push(folder);
+	}
+	return out;
+}
+
+/**
+ * Whether a vault path is in one of the event folders. An empty folder means
+ * the whole vault. Folder boundaries count: "Courses" does not cover
+ * "Courses2/x.md".
+ */
+export function inEventFolders(path: string, folders: string[]): boolean {
+	return folders.some((folder) => !folder || path.startsWith(`${folder}/`));
 }

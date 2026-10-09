@@ -67,6 +67,16 @@ export class SyncEngine {
 			report.errors.push("A sync is already in progress.");
 			return report;
 		}
+		// Only one computer syncs a shared vault; see sync/device.ts.
+		if (!(await this.plugin.isSyncDevice())) {
+			const other = this.plugin.settings.syncDevice?.name;
+			const message = other
+				? `This computer does not sync with calendar services; ${other} does. Change it under Settings → Typed Calendar → Sync.`
+				: "No computer is set to sync with calendar services. Turn it on under Settings → Typed Calendar → Sync.";
+			report.errors.push(message);
+			if (notify) new Notice(`Typed Calendar: ${message}`);
+			return report;
+		}
 
 		const { caldav } = this.plugin.settings;
 		const icloud = caldav.username && caldav.password ? caldav.calendars.filter((c) => c.enabled) : [];

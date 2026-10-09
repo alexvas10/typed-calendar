@@ -1,6 +1,7 @@
 import { App, Component, TAbstractFile, TFile, debounce } from "obsidian";
 import { CalendarEvent, isScheduled } from "../model/types";
 import { eventFromFrontmatter } from "../model/serialize";
+import { inEventFolders, normalizeFolderList } from "../settings/settings";
 
 type Listener = () => void;
 
@@ -23,7 +24,7 @@ const NOTIFY_DELAY_MS = 150;
 export class EventIndex extends Component {
 	private events = new Map<string, CalendarEvent>();
 	private listeners = new Set<Listener>();
-	private folder: string;
+	private folders: string[];
 	/**
 	 * Not reset by later calls, so a long burst still redraws every
 	 * NOTIFY_DELAY_MS rather than going quiet until it ends. Reads (all(),
@@ -37,9 +38,9 @@ export class EventIndex extends Component {
 		false
 	);
 
-	constructor(private app: App, folder: string) {
+	constructor(private app: App, folder: string, extra: string[] = []) {
 		super();
-		this.folder = normalizeFolder(folder);
+		this.folders = normalizeFolders(folder, extra);
 	}
 
 	onload(): void {
@@ -92,10 +93,11 @@ export class EventIndex extends Component {
 		this.events.clear();
 	}
 
-	setFolder(folder: string): void {
-		const next = normalizeFolder(folder);
-		if (next === this.folder) return;
-		this.folder = next;
+	/** The main event folder plus any extra ones; rebuilds only when they change. */
+	setFolders(folder: string, extra: string[] = []): void {
+		const next = normalizeFolders(folder, extra);
+		if (next.join("\n") === this.folders.join("\n")) return;
+		this.folders = next;
 		this.rebuild();
 	}
 
@@ -157,8 +159,7 @@ export class EventIndex extends Component {
 	private inScope(path: string): boolean {
 		if (!path.endsWith(".md")) return false;
 		// An empty folder setting means the whole vault is in scope.
-		if (!this.folder) return true;
-		return path.startsWith(`${this.folder}/`);
+		return inEventFolders(path, this.folders);
 	}
 
 	private notify(): void {
@@ -166,6 +167,7 @@ export class EventIndex extends Component {
 	}
 }
 
-function normalizeFolder(folder: string): string {
-	return folder.replace(/^\/+|\/+$/g, "");
+function normalizeFolders(folder: string, extra: string[]): string[] {
+	const main = folder.replace(/^\/+|\/+$/g, "");
+	return [main, ...normalizeFolderList(extra).filter((f) => f !== main)];
 }

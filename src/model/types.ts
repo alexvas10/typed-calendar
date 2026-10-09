@@ -130,6 +130,12 @@ export interface OccurrenceOverride {
 	title?: string;
 	location?: string;
 	description?: string;
+	/**
+	 * This one occurrence is crossed off (the whole series has `done` on the
+	 * event instead). Kept in the overrides list because on a server a
+	 * crossed-off occurrence is a RECURRENCE-ID component with a ✓ title.
+	 */
+	done?: boolean;
 }
 
 export interface CalendarEvent {
@@ -166,6 +172,12 @@ export interface CalendarEvent {
 	 * real calendar.
 	 */
 	readOnly?: boolean;
+	/**
+	 * Crossed off: handed in, finished. The event stays -- other plugins may
+	 * still count it (a graded assignment) -- but the views hide it unless
+	 * "Show completed" is on, and synced copies carry a check mark.
+	 */
+	done?: boolean;
 	icloud?: ICloudMeta;
 	google?: SyncBinding;
 	outlook?: SyncBinding;
@@ -202,4 +214,21 @@ export function isPullOnlySeries(event: CalendarEvent): boolean {
  */
 export function isLocked(event: CalendarEvent): boolean {
 	return event.readOnly === true || isPullOnlySeries(event);
+}
+
+/**
+ * An empty filter set means "no filter applied", not "hide everything" --
+ * otherwise a fresh install would open to a blank calendar.
+ */
+export function matchesFilters(event: CalendarEvent, active: string[]): boolean {
+	if (active.length === 0) return true;
+	return event.types.some((type) => active.includes(type));
+}
+
+/**
+ * Whether a view shows an event: it passes the type filter, and it is not
+ * crossed off -- unless "Show completed" is on.
+ */
+export function showsEvent(event: CalendarEvent, active: string[], showCompleted: boolean): boolean {
+	return (showCompleted || !event.done) && matchesFilters(event, active);
 }

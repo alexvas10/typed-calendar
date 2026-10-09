@@ -580,6 +580,17 @@
 	color: var(--text-faint);
 }
 
+.tc-types-popover-completed {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 8px;
+	padding-top: 8px;
+	border-top: 1px solid var(--background-modifier-border);
+	font-size: var(--font-ui-small);
+	cursor: pointer;
+}
+
 /* ---- year view ---- */
 
 .tc-calendar-grid.fc .fc-multimonth {
@@ -629,6 +640,15 @@
 /* Locked events cannot be dragged; say so with the cursor. */
 .tc-calendar-grid.fc .tc-event-locked {
 	cursor: default;
+}
+
+/* Crossed off, shown only with "Show completed". */
+.tc-calendar-grid.fc .tc-event-done {
+	opacity: 0.55;
+}
+
+.tc-calendar-grid.fc .tc-event-done .fc-event-title {
+	text-decoration: line-through;
 }
 
 .tc-calendar-grid.fc .fc-highlight {
@@ -794,4 +814,8 @@
 	left: 6px;
 	right: 6px;
 	border-top: 1px solid var(--background-modifier-border);
+}
+
+.tc-setting-indent {
+	padding-left: 18px;
 }

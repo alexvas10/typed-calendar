@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { markTitle, readTitle } from "../done";
 import { CalendarEvent, OccurrenceOverride } from "../../model/types";
 import { activeOverrides, applyOverride, isOccurrenceOf } from "../../model/occurrences";
 import { formatRRule, parseRRule } from "../rrule";
@@ -175,7 +176,8 @@ export function readEvent(master: GoogleEvent, instances: GoogleEvent[], timezon
 
 	const parsed: ParsedVEvent = {
 		uid: privateProps[PRIVATE.uid] || master.iCalUID || master.id,
-		title: master.summary ?? "Untitled",
+		title: readTitle(master.summary).title || "Untitled",
+		done: readTitle(master.summary).done || undefined,
 		date: timing.date,
 		allDay: timing.allDay,
 		recurring: false,
@@ -233,9 +235,12 @@ export function readEvent(master: GoogleEvent, instances: GoogleEvent[], timezon
 		}
 		const differs = (value: string | undefined, series: string | undefined) =>
 			value && value.trim() !== (series ?? "").trim();
-		if (differs(instance.summary, master.summary)) override.title = instance.summary;
+		const plain = (summary: string | undefined) => (summary === undefined ? undefined : readTitle(summary).title);
+		if (differs(plain(instance.summary), plain(master.summary))) override.title = plain(instance.summary);
 		if (differs(instance.location, master.location)) override.location = instance.location;
 		if (differs(instance.description, master.description)) override.description = instance.description;
+		// Crossed off on its own (see readOverride in ics.ts).
+		if (readTitle(instance.summary).done && !readTitle(master.summary).done) override.done = true;
 		// A record that matches the series is what "Reset to series" leaves
 		// behind: Google has no way to delete it, only to put it back in line.
 		// Reading it as a change would reset it again on every sync. (Unlike
@@ -307,7 +312,7 @@ export function privateFields(event: CalendarEvent): Record<string, string> {
  */
 export function eventBody(event: CalendarEvent, timezone: string): Partial<GoogleEvent> {
 	const body: Partial<GoogleEvent> = {
-		summary: event.title,
+		summary: markTitle(event.title, event.done),
 		// An empty string clears a field on patch; leaving it out would keep
 		// the old value.
 		location: event.location ?? "",
@@ -324,7 +329,7 @@ export function eventBody(event: CalendarEvent, timezone: string): Partial<Googl
 export function occurrenceBody(event: CalendarEvent, occurrence: string, override: OccurrenceOverride | undefined, timezone: string): Partial<GoogleEvent> {
 	const instance = applyOverride(event, occurrence, override);
 	return {
-		summary: instance.title,
+		summary: markTitle(instance.title, instance.done),
 		location: instance.location ?? "",
 		description: instance.description ?? "",
 		...timeFields(instance.date, instance.allDay, instance.startTime, instance.endTime, timezone),

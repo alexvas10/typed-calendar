@@ -4,7 +4,7 @@ import { indexTypes, missingFields } from "../model/priority";
 import {
 	EXPECTING_VIEW,
 	colorFor,
-	matchesFilters,
+	showsEvent,
 	renderFilterBar,
 } from "./shared";
 
@@ -55,7 +55,7 @@ export class ExpectingSoonView extends ItemView {
 		const typeMap = indexTypes(this.plugin.settings.eventTypes);
 		const events = this.plugin.index
 			.unscheduled()
-			.filter((event) => matchesFilters(event, active))
+			.filter((event) => showsEvent(event, active, this.plugin.settings.showCompleted))
 			.sort((a, b) => a.title.localeCompare(b.title));
 
 		const list = root.createDiv({ cls: "tc-list" });

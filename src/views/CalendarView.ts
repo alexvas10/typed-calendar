@@ -24,7 +24,7 @@ import {
 	CALENDAR_VIEW,
 	EXPECTING_VIEW,
 	colorFor,
-	matchesFilters,
+	showsEvent,
 	renderFilterBar,
 } from "./shared";
 
@@ -248,10 +248,13 @@ export class CalendarGridView extends ItemView {
 		const active = this.plugin.settings.activeFilters;
 		const window = this.range ?? defaultRange();
 		const inputs: EventInput[] = [];
+		const showCompleted = this.plugin.settings.showCompleted;
 		for (const event of this.plugin.index.scheduled()) {
-			if (!matchesFilters(event, active)) continue;
+			if (!showsEvent(event, active, showCompleted)) continue;
 			const color = colorFor(event, typeMap);
 			for (const instance of expandEvent(event, window)) {
+				// One week of a series can be crossed off on its own.
+				if (instance.done && !showCompleted) continue;
 				inputs.push(toEventInput(event, instance, color));
 			}
 		}
@@ -301,7 +304,12 @@ export class CalendarGridView extends ItemView {
 		return count > 0 ? `Types · ${count}` : "Types";
 	}
 
-	private awaitingLabel(count = this.plugin.index.unscheduled().length): string {
+	/** Undated events still to be dealt with; crossed-off ones are not waiting for anything. */
+	private awaitingCount(): number {
+		return this.plugin.index.unscheduled().filter((event) => !event.done).length;
+	}
+
+	private awaitingLabel(count = this.awaitingCount()): string {
 		return `${count} awaiting date${count === 1 ? "" : "s"}`;
 	}
 
@@ -312,7 +320,7 @@ export class CalendarGridView extends ItemView {
 	 */
 	private updateToolbar(): void {
 		if (!this.calendar) return;
-		const awaiting = this.plugin.index.unscheduled().length;
+		const awaiting = this.awaitingCount();
 		const labels = `${this.typesLabel()}|${this.awaitingLabel(awaiting)}`;
 		// Hidden rather than shown as "0 awaiting dates": nothing to act on.
 		this.gridEl.toggleClass("tc-no-awaiting", awaiting === 0);
@@ -402,6 +410,14 @@ export class CalendarGridView extends ItemView {
 				this.plugin.settings.activeFilters.length > 0
 					? "Showing events of any selected type."
 					: "Nothing selected shows every type.",
+		});
+		const completed = popover.createEl("label", { cls: "tc-types-popover-completed" });
+		const box = completed.createEl("input", { type: "checkbox" });
+		box.checked = this.plugin.settings.showCompleted;
+		completed.appendText(" Show completed");
+		box.addEventListener("change", () => {
+			this.plugin.settings.showCompleted = box.checked;
+			void this.plugin.saveSettings();
 		});
 	}
 
@@ -585,6 +601,7 @@ function toEventInput(
 	if (instance.override) classNames.push("tc-event-changed");
 	const locked = isLocked(event);
 	if (locked) classNames.push("tc-event-locked");
+	if (instance.done) classNames.push("tc-event-done");
 	const input: EventInput = {
 		// One note can draw many blocks, so the id has to name the occurrence --
 		// by the date the rule gave it, which a move does not change.

@@ -163,6 +163,14 @@ How it behaves:
   iCloud has it, for a finished course kept as a record, say. The plugin then
   never writes, moves or deletes its iCloud copy, while the note still follows
   the server. Remove the line to unlock it.
+- **Crossing an event off.** Tick *Done* in the editor (or set `done: true`).
+  The event disappears from the calendar and lists (Types → *Show completed*
+  brings it back, struck through). The note stays, and so does the synced
+  copy: it shows as `✓ Title` on your phone. Typing `✓ ` in front of a title
+  on the phone crosses it off here too, and removing the mark undoes it.
+  One occurrence of a repeating event can be crossed off on its own
+  (`overrides: [{ occurrence: 2026-02-18, done: true }]`); on the phone only
+  that occurrence gets the ✓.
 - **Recurring events** are two-way, within the supported subset above. A rule
   the plugin parsed is written back as a real `RRULE`, cancelled occurrences
   as `EXDATE`s, and changed occurrences as `RECURRENCE-ID` components edited
@@ -323,6 +331,7 @@ allDay: false
 location: MC 4021
 timezone: America/Toronto
 status: confirmed          # confirmed | tbd
+done: true                 # crossed off: hidden from views, "✓" on synced copies
 props:
   course: CS 3600
   weight: 45
@@ -332,6 +341,12 @@ overrides: [ ... ]         # single occurrences that differ from the series
 icloud: { ... }            # plugin-managed sync bookkeeping; do not hand-edit
 ---
 ```
+
+Event notes are read from the event folder and from any folder listed under
+**Also read events from** in settings. Another plugin can add one there
+through the API (Typed Classes adds its course folder). Such notes sync like
+any other, and they stay in their own folder when edited. Events pulled new
+from a server always land in the event folder.
 
 Key names deliberately overlap Full Calendar's, so events remain readable by it
 if you ever switch.

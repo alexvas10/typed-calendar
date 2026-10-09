@@ -6,6 +6,7 @@ import { isValidTimezone, toWallClock, utcToWallClock, wallClockToUtc } from "..
 import { addDays } from "../util/dates";
 import { formatRRule, parseRRule, sameRule } from "./rrule";
 import { buildVTimezone } from "./vtimezone";
+import { markTitle, readTitle } from "./done";
 
 const PROD_ID = "-//Typed Calendar//Obsidian//EN";
 const TYPES_PROP = "x-typedcal-types";
@@ -23,6 +24,8 @@ export interface ParsedVEvent {
 	description?: string;
 	/** Server-side modification time, used to decide who wins a conflict. */
 	remoteModified?: string;
+	/** Crossed off on the server: its title carries the check mark (see done.ts). */
+	done?: boolean;
 	/** Present only when the event was last written by this plugin. */
 	types?: string[];
 	props?: Record<string, unknown>;
@@ -89,7 +92,7 @@ export function eventToICS(event: CalendarEvent, fallbackTimezone: string): stri
 	calendar.addSubcomponent(vevent);
 
 	vevent.updatePropertyWithValue("uid", event.uid);
-	vevent.updatePropertyWithValue("summary", event.title);
+	vevent.updatePropertyWithValue("summary", markTitle(event.title, event.done));
 
 	setTiming(calendar, vevent, event, timezone);
 
@@ -370,7 +373,9 @@ function readFields(vevent: ICAL.Component, timezone: string): ComponentFields |
 		["description", "description"],
 	] as const) {
 		const value = vevent.getFirstPropertyValue(name);
-		if (value) fields[key] = String(value);
+		// Titles are compared and stored without the done mark; icsToEvent
+		// reads the mark off the master separately.
+		if (value) fields[key] = key === "title" ? readTitle(String(value)).title : String(value);
 	}
 	return fields;
 }
@@ -388,10 +393,15 @@ function readFields(vevent: ICAL.Component, timezone: string): ComponentFields |
  * rewrites every later occurrence, and a cancelled instance, which Apple
  * never writes and other clients mean as an exclusion.
  */
+function marked(component: ICAL.Component): boolean {
+	return readTitle(String(component.getFirstPropertyValue("summary") ?? "")).done;
+}
+
 function readOverride(
 	component: ICAL.Component,
 	series: ComponentFields,
-	timezone: string
+	timezone: string,
+	seriesMarked: boolean
 ): OccurrenceOverride | null {
 	const recurrenceId = component.getFirstProperty("recurrence-id");
 	if (!recurrenceId || recurrenceId.getParameter("range")) return null;
@@ -417,6 +427,10 @@ function readOverride(
 		const value = fields[key];
 		if (value && value.trim() !== (series[key] ?? "").trim()) override[key] = value;
 	}
+	// Crossed off on its own: its title carries the mark and the series' does
+	// not. (When the series is done every occurrence is marked; that is the
+	// event's `done`, not this one's.)
+	if (marked(component) && !seriesMarked) override.done = true;
 	return override;
 }
 
@@ -482,6 +496,7 @@ export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 		date: fields.date,
 		recurring: Boolean(rrule) || hasRdate,
 	};
+	if (readTitle(String(vevent.getFirstPropertyValue("summary") ?? "")).done) parsed.done = true;
 	if (!fields.allDay) {
 		parsed.startTime = fields.startTime;
 		if (fields.endTime) parsed.endTime = fields.endTime;
@@ -495,7 +510,7 @@ export function icsToEvent(ics: string, timezone: string): ParsedVEvent | null {
 		let readable = Boolean(rule);
 		for (const instance of rule ? instances : []) {
 			if (String(instance.getFirstPropertyValue("uid") ?? "") !== uid) continue;
-			const override = readOverride(instance, fields, timezone);
+			const override = readOverride(instance, fields, timezone, marked(vevent));
 			// An override naming a date this plugin's expansion does not
 			// produce means the two disagree about the series itself. Owning
 			// it would mean deleting or misplacing that override on the next
@@ -651,7 +666,7 @@ function reconcileOverrides(
 			setTiming(calendar, component, asInstance(event, instance), timezone);
 			edited = true;
 		}
-		if (setText(component, "summary", instance.title)) edited = true;
+		if (setText(component, "summary", markTitle(instance.title, instance.done))) edited = true;
 		if (setText(component, "location", instance.location)) edited = true;
 		if (setText(component, "description", instance.description)) edited = true;
 		if (edited) {
@@ -666,7 +681,7 @@ function reconcileOverrides(
 		component.updatePropertyWithValue("uid", event.uid);
 		component.addProperty(occurrenceProperty("recurrence-id", master, override.occurrence, timezone));
 		setTiming(calendar, component, asInstance(event, instance), timezone);
-		setText(component, "summary", instance.title);
+		setText(component, "summary", markTitle(instance.title, instance.done));
 		setText(component, "location", instance.location);
 		setText(component, "description", instance.description);
 		for (const alarm of master.getAllSubcomponents("valarm")) {
@@ -760,7 +775,7 @@ export function patchICS(
 
 	let changed = false;
 	for (const [name, value] of [
-		["summary", event.title],
+		["summary", markTitle(event.title, event.done)],
 		["location", event.location],
 		["description", event.description],
 	] as const) {

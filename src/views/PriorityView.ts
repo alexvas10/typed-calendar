@@ -6,7 +6,7 @@ import { EventType } from "../model/types";
 import {
 	PRIORITY_VIEW,
 	colorFor,
-	matchesFilters,
+	showsEvent,
 	renderFilterBar,
 } from "./shared";
 
@@ -51,11 +51,12 @@ export class PriorityView extends ItemView {
 
 		const events = this.plugin.index
 			.scheduled()
-			.filter((event) => matchesFilters(event, active));
+			.filter((event) => showsEvent(event, active, this.plugin.settings.showCompleted));
 		const rows = buildPriorityRows(
 			events,
 			this.plugin.settings.eventTypes,
-			this.plugin.settings.priorityHorizonDays
+			this.plugin.settings.priorityHorizonDays,
+			!this.plugin.settings.showCompleted
 		);
 
 		const list = root.createDiv({ cls: "tc-list" });

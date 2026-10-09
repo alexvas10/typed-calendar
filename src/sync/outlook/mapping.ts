@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { markTitle, readTitle } from "../done";
 import { CalendarEvent, OccurrenceOverride } from "../../model/types";
 import {
 	NthWeekday,
@@ -268,7 +269,8 @@ function readFields(event: GraphEvent): Fields | null {
 	const fields: Fields = {
 		date: start.date,
 		allDay: Boolean(event.isAllDay),
-		title: event.subject,
+		// Plain title: the done mark is read off the master in readEvent.
+		title: event.subject === undefined ? undefined : readTitle(event.subject).title,
 		location: text(event.location?.displayName),
 		description: text(event.body?.content),
 	};
@@ -304,6 +306,7 @@ export function readEvent(event: GraphEvent, instances: GraphEvent[], window: { 
 	const parsed: ParsedVEvent = {
 		uid: property(event, PROPERTY.uid) || event.iCalUId || event.id,
 		title: fields.title ?? "Untitled",
+		done: readTitle(event.subject).done || undefined,
 		date: fields.date,
 		allDay: fields.allDay,
 		recurring: event.type === "seriesMaster",
@@ -359,6 +362,8 @@ export function readEvent(event: GraphEvent, instances: GraphEvent[], window: { 
 		if (differs(text(own.title), text(fields.title))) override.title = own.title;
 		if (differs(own.location, fields.location)) override.location = own.location;
 		if (differs(own.description, fields.description)) override.description = own.description;
+		// Crossed off on its own (see readOverride in ics.ts).
+		if (readTitle(instance.subject).done && !readTitle(event.subject).done) override.done = true;
 		// An exception that matches the series is what a reset leaves behind;
 		// see the Google reader for why it is not a change.
 		if (Object.keys(override).length > 1) overrides.push(override);
@@ -427,7 +432,7 @@ export function extendedProperties(event: CalendarEvent): { id: string; value: s
 /** The fields this plugin owns, as a body for create or patch. */
 export function eventBody(event: CalendarEvent, timezone: string): Record<string, unknown> {
 	const body: Record<string, unknown> = {
-		subject: event.title,
+		subject: markTitle(event.title, event.done),
 		body: { contentType: "text", content: event.description ?? "" },
 		location: { displayName: event.location ?? "" },
 		...timeFields(event.date as string, event.allDay, event.startTime, event.endTime, timezone),
@@ -441,7 +446,7 @@ export function eventBody(event: CalendarEvent, timezone: string): Record<string
 export function occurrenceBody(event: CalendarEvent, occurrence: string, override: OccurrenceOverride | undefined, timezone: string): Record<string, unknown> {
 	const instance = applyOverride(event, occurrence, override);
 	return {
-		subject: instance.title,
+		subject: markTitle(instance.title, instance.done),
 		body: { contentType: "text", content: instance.description ?? "" },
 		location: { displayName: instance.location ?? "" },
 		...timeFields(instance.date, instance.allDay, instance.startTime, instance.endTime, timezone),

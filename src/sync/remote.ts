@@ -1,4 +1,5 @@
 import { CalendarEvent, OccurrenceOverride, ProviderKey } from "../model/types";
+import { readTitle } from "./done";
 import { activeOverrides, applyOverride } from "../model/occurrences";
 import { ParsedVEvent } from "./ics";
 import { sameRule } from "./rrule";
@@ -78,8 +79,11 @@ export function sameMaster(remote: ParsedVEvent, event: CalendarEvent): boolean 
 			return false;
 		}
 	}
+	if (Boolean(remote.done) !== Boolean(event.done)) return false;
 	return (
-		text(remote.title, event.title) &&
+		// What the service shows is the plain title; a note whose own title
+		// starts with a check mark must not read as changed on every pass.
+		text(remote.title, readTitle(event.title).title) &&
 		text(remote.location, event.location) &&
 		text(remote.description, event.description)
 	);
@@ -135,6 +139,8 @@ function seriesFields(remote: ParsedVEvent): Partial<CalendarEvent> {
 		endTime: remote.endTime,
 		location: remote.location,
 		description: remote.description,
+		// So an occurrence reads as done on the server exactly when it would here.
+		done: remote.done,
 	};
 }
 

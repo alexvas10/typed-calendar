@@ -16,6 +16,12 @@ async function ensureFolder(app: App, folder: string): Promise<void> {
 	}
 }
 
+/** The folder part of a vault path; "" for the vault root. */
+export function noteFolder(path: string): string {
+	const slash = path.lastIndexOf("/");
+	return slash >= 0 ? path.slice(0, slash) : "";
+}
+
 /** Appends " 2", " 3", ... until the path is free. */
 async function uniquePath(app: App, desired: string): Promise<string> {
 	if (!app.vault.getAbstractFileByPath(desired)) return desired;
@@ -28,9 +34,10 @@ async function uniquePath(app: App, desired: string): Promise<string> {
 }
 
 /**
- * Persists an event to its note. Creating writes a new file; saving updates
- * frontmatter in place and renames the file when the title or date changed, so
- * the folder stays sorted by date without the user maintaining names.
+ * Persists an event to its note. Creating writes a new file in `folder`;
+ * saving updates frontmatter in place and renames the file (within its own
+ * folder) when the title or date changed, so folders stay sorted by date
+ * without the user maintaining names.
  */
 export async function writeEventNote(
 	app: App,
@@ -69,7 +76,10 @@ export async function writeEventNote(
 		applyEventToFrontmatter(event, fm)
 	);
 
-	const desired = eventFilePath(folder, event);
+	// Renamed in place: a note keeps the folder it lives in. Notes in an extra
+	// event folder (a course's assessments) must not be pulled into the main
+	// one just because they were edited.
+	const desired = eventFilePath(noteFolder(existing.path), event);
 	if (desired !== existing.path) {
 		const target = await uniquePath(app, desired);
 		// fileManager.renameFile updates inbound links; vault.rename does not.

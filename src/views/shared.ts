@@ -5,14 +5,8 @@ export const CALENDAR_VIEW = "typed-calendar-grid";
 export const PRIORITY_VIEW = "typed-calendar-priority";
 export const EXPECTING_VIEW = "typed-calendar-expecting";
 
-/**
- * An empty filter set means "no filter applied", not "hide everything" --
- * otherwise a fresh install would open to a blank calendar.
- */
-export function matchesFilters(event: CalendarEvent, active: string[]): boolean {
-	if (active.length === 0) return true;
-	return event.types.some((type) => active.includes(type));
-}
+// Pure, so they live with the model where tests can reach them.
+export { matchesFilters, showsEvent } from "../model/types";
 
 /** First type that has a colour wins; untyped events fall back to the theme. */
 export function colorFor(

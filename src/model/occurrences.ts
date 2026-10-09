@@ -18,6 +18,8 @@ export interface Occurrence {
 	endTime?: string;
 	location?: string;
 	description?: string;
+	/** Crossed off: the whole series is, or this occurrence on its own. */
+	done?: boolean;
 	/** Present when this occurrence was changed on its own. */
 	override?: OccurrenceOverride;
 }
@@ -41,6 +43,7 @@ export function applyOverride(event: CalendarEvent, occurrence: string, override
 		endTime: allDay || !startTime ? undefined : override?.endTime ?? event.endTime,
 		location: override?.location ?? event.location,
 		description: override?.description ?? event.description,
+		done: event.done || override?.done ? true : undefined,
 		override,
 	};
 }
@@ -149,7 +152,27 @@ export function buildOverride(
 	const location = change.location === undefined ? existing?.location : change.location.trim();
 	if (location && location !== event.location) override.location = location;
 	if (existing?.description) override.description = existing.description;
+	// Moving or retitling an occurrence does not un-cross it.
+	if (existing?.done) override.done = true;
 
 	if (!existing && Object.keys(override).length === 1) return null;
 	return override;
+}
+
+/**
+ * The overrides list with one occurrence crossed off or back on. Crossing off
+ * adds a bare entry if there is none; un-crossing only drops the flag, so an
+ * entry standing for a change made elsewhere (an alarm on that date, say)
+ * is never lost with it.
+ */
+export function withOccurrenceDone(overrides: OccurrenceOverride[] | undefined, occurrence: string, done: boolean): OccurrenceOverride[] {
+	const list = (overrides ?? []).map((override) => ({ ...override }));
+	const existing = list.find((override) => override.occurrence === occurrence);
+	if (done) {
+		if (existing) existing.done = true;
+		else list.push({ occurrence, done: true });
+	} else if (existing) {
+		delete existing.done;
+	}
+	return list.sort((a, b) => a.occurrence.localeCompare(b.occurrence));
 }

@@ -255,6 +255,9 @@ export function mergeRemote(
 	return {
 		...event,
 		title: remote.title,
+		// The check mark is standard text in the title, so it round-trips and
+		// the server's copy wins, like the title itself.
+		done: remote.done ? true : undefined,
 		date: remote.date,
 		startTime: remote.startTime,
 		endTime: remote.endTime,
@@ -304,6 +307,7 @@ export function newEventFromRemote(
 	return {
 		uid,
 		title: remote.title,
+		done: remote.done ? true : undefined,
 		types: addTypes(remote.types ?? []),
 		date: remote.date,
 		recurrence: remote.recurrence,

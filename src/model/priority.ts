@@ -76,7 +76,9 @@ export function indexTypes(types: EventType[]): Map<string, EventType> {
 export function buildPriorityRows(
 	events: CalendarEvent[],
 	types: EventType[],
-	horizonDays: number
+	horizonDays: number,
+	/** Leave out crossed-off occurrences (a whole done event is filtered by the caller). */
+	hideDone = false
 ): PriorityRow[] {
 	const typeMap = indexTypes(types);
 	const today = startOfToday();
@@ -90,6 +92,7 @@ export function buildPriorityRows(
 		// A repeating event contributes every occurrence inside the horizon;
 		// a single one contributes itself, or nothing when it falls outside.
 		for (const instance of expandEvent(event, { from, to })) {
+			if (hideDone && instance.done) continue;
 			const days = daysUntil(instance.date, today);
 			if (days === null) continue;
 			rows.push({

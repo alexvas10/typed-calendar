@@ -14,14 +14,17 @@ import { GoogleProvider } from "./src/sync/google/client";
 import { OutlookProvider } from "./src/sync/outlook/client";
 import { RemoteProvider } from "./src/sync/remote";
 import { excludeLink } from "./src/sync/notes";
-import { isOccurrenceOf } from "./src/model/occurrences";
+import { Occurrence, expandEvent, isOccurrenceOf, withOccurrenceDone } from "./src/model/occurrences";
 import { SyncEngine } from "./src/sync/SyncEngine";
 import { writeAgentDocs } from "./src/agent/docs";
-import { EventType } from "./src/model/types";
+import { EventType, TypeField } from "./src/model/types";
 import { generateUid } from "./src/model/serialize";
+import { SyncDevice, isSyncDevice, newDeviceId, shouldClaim } from "./src/sync/device";
 import {
 	DEFAULT_SETTINGS,
+	inEventFolders,
 	TypedCalendarSettings,
+	mergeTypeFields,
 	normalizeSettings,
 	uniqueTypeId,
 } from "./src/settings/settings";
@@ -57,15 +60,39 @@ export default class TypedCalendarPlugin extends Plugin {
 	/**
 	 * Optional scripted surface for agents and Templater. Writing event notes
 	 * directly is the supported path; this is a convenience on top.
+	 *
+	 * Other plugins build on it too, so `version` goes up only when an existing
+	 * entry changes shape; adding an entry does not bump it.
 	 */
 	readonly api = {
+		version: 1,
+		/** Calls `listener` whenever the event index changes. Returns an unsubscribe. */
+		onChange: (listener: () => void): (() => void) => this.index.onChange(listener),
+		/** The folder new event notes are written to. */
+		eventFolder: (): string => this.settings.eventFolder,
+		/** Every folder event notes are read (and synced) from, the main one first. */
+		eventFolders: (): string[] => [this.settings.eventFolder, ...this.settings.extraEventFolders],
+		/**
+		 * Also read and sync event notes from `folder`. Kept in settings, so it
+		 * survives the caller being disabled; the user can remove it there.
+		 */
+		addEventFolder: (folder: string) => this.addEventFolder(folder),
 		listEvents: (): CalendarEvent[] => this.index.all(),
 		listScheduled: (): CalendarEvent[] => this.index.scheduled(),
 		listUnscheduled: (): CalendarEvent[] => this.index.unscheduled(),
 		createType: (label: string, color = "#888888", rank = 10) =>
 			this.createType(label, color, rank),
 		listTypes: (): EventType[] => this.settings.eventTypes,
-		createEvent: (event: Partial<CalendarEvent>) =>
+		/**
+		 * Declares fields on a type so they show in the event editor. Only
+		 * missing keys are added; an existing field is never changed.
+		 */
+		addTypeFields: (typeId: string, fields: TypeField[]) => this.addTypeFields(typeId, fields),
+		/**
+		 * `folder`, when given, must be one of eventFolders() or inside one, so
+		 * the new note is indexed and synced like any other.
+		 */
+		createEvent: (event: Partial<CalendarEvent> & { folder?: string }) =>
 			this.writeEvent(
 				{
 					uid: event.uid ?? generateUid(),
@@ -82,11 +109,31 @@ export default class TypedCalendarPlugin extends Plugin {
 					props: event.props ?? {},
 					recurrence: event.recurrence,
 					exceptions: event.exceptions,
+					done: event.done ? true : undefined,
 					path: "",
 				},
-				true
+				true,
+				this.creationFolder(event.folder)
 			),
 		updateEvent: (event: CalendarEvent) => this.writeEvent(event, false),
+		/**
+		 * Crosses an event off, or back on. A done event stays in the vault and
+		 * in sync, marked as done; the views hide it unless Show completed is on.
+		 */
+		setDone: (uid: string, done: boolean) => this.setDone(uid, done),
+		/** Crosses off one occurrence of a repeating event (`occurrence` is the date the rule gives it). */
+		setOccurrenceDone: (uid: string, occurrence: string, done: boolean) =>
+			this.setOccurrenceDone(uid, occurrence, done),
+		/**
+		 * The occurrences of an event within [from, to] (YYYY-MM-DD), with any
+		 * per-occurrence change and done state applied. A one-off event gives
+		 * itself when its date is in range.
+		 */
+		listOccurrences: (uid: string, from: string, to: string): Occurrence[] => {
+			const event = this.index.byUid(uid);
+			if (!event) throw new Error(`No event with uid ${uid}.`);
+			return expandEvent(event, { from, to });
+		},
 		/** Removes the event from iCloud and then from the vault, in that order. */
 		deleteEvent: (uid: string) => {
 			const event = this.index.byUid(uid);
@@ -113,13 +160,19 @@ export default class TypedCalendarPlugin extends Plugin {
 		/** Puts a changed occurrence back in line with its series. */
 		resetOccurrence: (uid: string, date: string) =>
 			this.setOccurrenceOverride(uid, { occurrence: date }, true),
+		/** Opens the event editor, on one occurrence when `occurrence` is given. */
+		openEvent: (uid: string, occurrence?: string) => {
+			const event = this.index.byUid(uid);
+			if (!event) throw new Error(`No event with uid ${uid}.`);
+			this.openEventModal(event, undefined, occurrence);
+		},
 		sync: () => this.sync.run(),
 	};
 
 	async onload(): Promise<void> {
 		this.settings = normalizeSettings(await this.loadData());
 
-		this.index = new EventIndex(this.app, this.settings.eventFolder);
+		this.index = new EventIndex(this.app, this.settings.eventFolder, this.settings.extraEventFolders);
 		this.addChild(this.index);
 
 		this.sync = new SyncEngine(this.app, this);
@@ -203,8 +256,96 @@ export default class TypedCalendarPlugin extends Plugin {
 	 * Saves an event note and returns the file. The index picks the change up
 	 * through metadataCache, so nothing here touches the in-memory map.
 	 */
-	async writeEvent(event: CalendarEvent, isNew: boolean): Promise<TFile> {
-		return writeEventNote(this.app, this.settings.eventFolder, event, isNew);
+	async writeEvent(event: CalendarEvent, isNew: boolean, folder = this.settings.eventFolder): Promise<TFile> {
+		return writeEventNote(this.app, folder, event, isNew);
+	}
+
+	/** Where a new event goes: the main folder, or a caller's folder inside an event folder. */
+	private creationFolder(folder: string | undefined): string {
+		if (folder === undefined) return this.settings.eventFolder;
+		const clean = folder.replace(/^\/+|\/+$/g, "");
+		const roots = [this.settings.eventFolder, ...this.settings.extraEventFolders];
+		if (!inEventFolders(`${clean}/x.md`, roots)) {
+			throw new Error(`${clean || "The vault root"} is not in an event folder, so a note there would be neither shown nor synced.`);
+		}
+		return clean;
+	}
+
+	async addEventFolder(folder: string): Promise<void> {
+		const clean = folder.trim().replace(/^\/+|\/+$/g, "");
+		if (!clean) throw new Error("addEventFolder needs a folder; the whole vault is set with the event folder setting.");
+		if (clean === this.settings.eventFolder || this.settings.extraEventFolders.includes(clean)) return;
+		this.settings.extraEventFolders = [...this.settings.extraEventFolders, clean];
+		await this.saveSettings();
+	}
+
+	/** This computer's id, kept in Obsidian's per-device storage; made on first use. */
+	deviceId(): string {
+		const key = "typed-calendar-device-id";
+		const app = this.app as unknown as {
+			loadLocalStorage?: (key: string) => unknown;
+			saveLocalStorage?: (key: string, value: unknown) => void;
+		};
+		// loadLocalStorage (Obsidian 1.8.7+) is scoped to this vault; older
+		// builds get the same scoping by hand.
+		const fallbackKey = `${key}:${this.app.vault.getName()}`;
+		const stored = app.loadLocalStorage ? app.loadLocalStorage(key) : window.localStorage.getItem(fallbackKey);
+		if (typeof stored === "string" && stored) return stored;
+		const id = newDeviceId();
+		if (app.saveLocalStorage) app.saveLocalStorage(key, id);
+		else window.localStorage.setItem(fallbackKey, id);
+		return id;
+	}
+
+	/** This computer, as the settings record it. */
+	thisDevice(): SyncDevice {
+		let name = "this computer";
+		try {
+			// Desktop-only plugin, so Node's os module is there.
+			name = (require("os") as { hostname(): string }).hostname() || name;
+		} catch {
+			// Keep the generic name.
+		}
+		return { id: this.deviceId(), name };
+	}
+
+	/**
+	 * Whether this computer is the one that syncs. Reads the settings file
+	 * fresh: when another computer takes over, its choice arrives in the file
+	 * through the vault sync, and this plugin's in-memory copy would not know.
+	 */
+	async isSyncDevice(): Promise<boolean> {
+		const stored = normalizeSettings(await this.loadData());
+		return isSyncDevice(stored.syncDevice ?? this.settings.syncDevice, this.deviceId());
+	}
+
+	/** Makes this computer the one that syncs (on), or no computer at all (off). */
+	async setSyncOnThisDevice(on: boolean): Promise<void> {
+		this.settings.syncDevice = on ? this.thisDevice() : { id: "", name: "" };
+		await this.saveSettings();
+	}
+
+	async setDone(uid: string, done: boolean): Promise<TFile> {
+		const event = this.index.byUid(uid);
+		if (!event) throw new Error(`No event with uid ${uid}.`);
+		if (event.readOnly) throw new Error(`"${event.title}" is locked (readOnly in its note).`);
+		if (Boolean(event.done) === done) return this.fileFor(event);
+		return this.writeEvent({ ...event, done: done ? true : undefined }, false);
+	}
+
+	async setOccurrenceDone(uid: string, occurrence: string, done: boolean): Promise<TFile> {
+		const event = this.index.byUid(uid);
+		if (!event) throw new Error(`No event with uid ${uid}.`);
+		if (event.readOnly) throw new Error(`"${event.title}" is locked (readOnly in its note).`);
+		if (!event.recurrence) throw new Error(`"${event.title}" does not repeat; cross the event itself off.`);
+		if (!isOccurrenceOf(event, occurrence)) throw new Error(`"${event.title}" has no occurrence on ${occurrence}.`);
+		return this.writeEvent({ ...event, overrides: withOccurrenceDone(event.overrides, occurrence, done) }, false);
+	}
+
+	private fileFor(event: CalendarEvent): TFile {
+		const file = this.app.vault.getAbstractFileByPath(event.path);
+		if (!(file instanceof TFile)) throw new Error(`Event note not found: ${event.path}`);
+		return file;
 	}
 
 	/**
@@ -381,6 +522,20 @@ export default class TypedCalendarPlugin extends Plugin {
 		return type;
 	}
 
+	/** Adds the fields a type is missing; see mergeTypeFields. */
+	async addTypeFields(typeId: string, fields: TypeField[]): Promise<EventType> {
+		const index = this.settings.eventTypes.findIndex((type) => type.id === typeId);
+		if (index < 0) throw new Error(`No event type with id ${typeId}.`);
+		const current = this.settings.eventTypes[index];
+		const merged = mergeTypeFields(current, fields);
+		if (merged === current) return current;
+		this.settings.eventTypes[index] = merged;
+		await this.saveSettings();
+		// Same as createType: the docs list every field.
+		void this.refreshAgentDocs();
+		return merged;
+	}
+
 	/** Toggles a type chip; the sentinel "__clear__" resets the whole set. */
 	async toggleFilter(typeId: string): Promise<void> {
 		if (typeId === "__clear__") {
@@ -394,9 +549,22 @@ export default class TypedCalendarPlugin extends Plugin {
 		await this.saveSettings();
 	}
 
+	/**
+	 * The settings file changed on disk: a vault sync brought another
+	 * computer's version. Take it as it is. Saving the old in-memory copy
+	 * later would otherwise write stale settings back over it -- a laptop that
+	 * started before the desktop's settings arrived would wipe them.
+	 */
+	async onExternalSettingsChange(): Promise<void> {
+		this.settings = normalizeSettings(await this.loadData());
+		this.index.setFolders(this.settings.eventFolder, this.settings.extraEventFolders);
+		this.rescheduleSync();
+		this.refreshViews();
+	}
+
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
-		this.index.setFolder(this.settings.eventFolder);
+		this.index.setFolders(this.settings.eventFolder, this.settings.extraEventFolders);
 		this.rescheduleSync();
 		this.scheduleAgentDocs();
 		this.refreshViews();
@@ -429,6 +597,13 @@ export default class TypedCalendarPlugin extends Plugin {
 		const configured = Boolean(
 			(caldav.username && caldav.password) || google.tokens || outlook.tokens
 		);
+		// The first computer to have a service connected becomes the one that
+		// syncs; see sync/device.ts. The save lands back here with the same key,
+		// so this does not loop.
+		if (shouldClaim(this.settings.syncDevice, configured)) {
+			this.settings.syncDevice = this.thisDevice();
+			void this.saveSettings();
+		}
 		// Every settings save lands here -- toggling a type filter, the stamp a
 		// sync writes when it finishes. Restarting the countdown each time would
 		// keep postponing the next background sync, so only a change to the
