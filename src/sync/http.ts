@@ -1,5 +1,4 @@
-import { request as httpsRequest } from "node:https";
-import { request as httpRequest } from "node:http";
+import { nodeHttp, nodeHttps } from "./node";
 
 /**
  * Minimal HTTP transport for CalDAV.
@@ -10,8 +9,8 @@ import { request as httpRequest } from "node:http";
  * not an option either, since iCloud sends no CORS headers and the request is
  * blocked before it leaves the renderer.
  *
- * Node's http(s) module has neither restriction. It is available because this
- * plugin is desktop-only.
+ * Node's http(s) module has neither restriction. It exists on computers only;
+ * on iPad and iPhone the plugin sets a fallback (sync/mobileHttp.ts).
  */
 
 export interface DavResponse {
@@ -31,7 +30,21 @@ export interface DavRequestOptions {
 const DEFAULT_TIMEOUT = 30_000;
 const MAX_REDIRECTS = 5;
 
+type Transport = (options: DavRequestOptions) => Promise<DavResponse>;
+
+let fallback: Transport | null = null;
+
+/**
+ * Sends every request through `transport` instead of Node. Set by the plugin
+ * where Node is missing; this module does not import Obsidian, so the tests
+ * can run it outside the app.
+ */
+export function setFallbackTransport(transport: Transport): void {
+	fallback = transport;
+}
+
 export async function davRequest(options: DavRequestOptions): Promise<DavResponse> {
+	if (fallback) return fallback(options);
 	return send(options, 0);
 }
 
@@ -47,7 +60,7 @@ function send(options: DavRequestOptions, redirects: number): Promise<DavRespons
 			return;
 		}
 
-		const transport = target.protocol === "http:" ? httpRequest : httpsRequest;
+		const transport = target.protocol === "http:" ? nodeHttp().request : nodeHttps().request;
 		const payload = body ? Buffer.from(body, "utf8") : undefined;
 
 		const req = transport(

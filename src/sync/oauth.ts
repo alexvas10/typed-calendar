@@ -1,6 +1,6 @@
-import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
-import { createHash, randomBytes } from "node:crypto";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { davRequest } from "./http";
+import { nodeCrypto, nodeHttp } from "./node";
 
 /**
  * OAuth 2.0 sign-in for Google and Microsoft, the way both recommend for a
@@ -12,7 +12,7 @@ import { davRequest } from "./http";
  * for tokens with a PKCE verifier, so an intercepted code is useless on its
  * own. The plugin never sees a password.
  *
- * Available because the plugin is desktop-only (node:http, node:crypto).
+ * Computers only (node:http, node:crypto); signing in on iPad fails.
  */
 
 export interface OAuthConfig {
@@ -52,6 +52,7 @@ function base64Url(buffer: Buffer): string {
 
 /** A PKCE verifier and its S256 challenge (RFC 7636). */
 export function createPkce(): { verifier: string; challenge: string } {
+	const { createHash, randomBytes } = nodeCrypto();
 	const verifier = base64Url(randomBytes(32));
 	const challenge = base64Url(createHash("sha256").update(verifier).digest());
 	return { verifier, challenge };
@@ -154,7 +155,7 @@ export function signIn(
 	openBrowser: (url: string) => void
 ): Promise<OAuthTokens> {
 	const { verifier, challenge } = createPkce();
-	const state = base64Url(randomBytes(16));
+	const state = base64Url(nodeCrypto().randomBytes(16));
 
 	return new Promise((resolve, reject) => {
 		let server: Server | null = null;
@@ -168,7 +169,7 @@ export function signIn(
 		};
 
 		let redirectUri = "";
-		server = createServer((req: IncomingMessage, res: ServerResponse) => {
+		server = nodeHttp().createServer((req: IncomingMessage, res: ServerResponse) => {
 			const url = new URL(req.url ?? "/", redirectUri);
 			// Browsers also ask for /favicon.ico; only the redirect matters.
 			if (url.pathname !== "/") {

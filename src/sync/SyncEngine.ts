@@ -1,4 +1,4 @@
-import { App, Notice } from "obsidian";
+import { App, Notice, Platform } from "obsidian";
 import { CalDavClient } from "./caldav";
 import { eventToICS, icsToEvent, ParsedVEvent, patchICS } from "./ics";
 import {
@@ -70,7 +70,9 @@ export class SyncEngine {
 		// Only one computer syncs a shared vault; see sync/device.ts.
 		if (!(await this.plugin.isSyncDevice())) {
 			const other = this.plugin.settings.syncDevice?.name;
-			const message = other
+			const message = Platform.isMobileApp
+				? `Calendar sync runs on a computer, not on iPad or iPhone${other ? `; ${other} syncs` : ""}. Events edited here reach the calendars through it.`
+				: other
 				? `This computer does not sync with calendar services; ${other} does. Change it under Settings → Typed Calendar → Sync.`
 				: "No computer is set to sync with calendar services. Turn it on under Settings → Typed Calendar → Sync.";
 			report.errors.push(message);

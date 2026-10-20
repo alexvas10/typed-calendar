@@ -1,4 +1,4 @@
-import { Plugin, TFile, WorkspaceLeaf, debounce } from "obsidian";
+import { Platform, Plugin, TFile, WorkspaceLeaf, debounce } from "obsidian";
 import { EventIndex } from "./src/index/EventIndex";
 import { writeEventNote } from "./src/index/writer";
 import { EventModal, EventPrefill } from "./src/views/EventModal";
@@ -16,6 +16,8 @@ import { RemoteProvider } from "./src/sync/remote";
 import { excludeLink } from "./src/sync/notes";
 import { Occurrence, expandEvent, isOccurrenceOf, withOccurrenceDone } from "./src/model/occurrences";
 import { SyncEngine } from "./src/sync/SyncEngine";
+import { setFallbackTransport } from "./src/sync/http";
+import { mobileRequest } from "./src/sync/mobileHttp";
 import { writeAgentDocs } from "./src/agent/docs";
 import { EventType, TypeField } from "./src/model/types";
 import { generateUid } from "./src/model/serialize";
@@ -171,6 +173,8 @@ export default class TypedCalendarPlugin extends Plugin {
 
 	async onload(): Promise<void> {
 		this.settings = normalizeSettings(await this.loadData());
+		// No Node on iPad and iPhone; see sync/mobileHttp.ts.
+		if (Platform.isMobileApp) setFallbackTransport(mobileRequest);
 
 		this.index = new EventIndex(this.app, this.settings.eventFolder, this.settings.extraEventFolders);
 		this.addChild(this.index);
@@ -301,7 +305,7 @@ export default class TypedCalendarPlugin extends Plugin {
 	thisDevice(): SyncDevice {
 		let name = "this computer";
 		try {
-			// Desktop-only plugin, so Node's os module is there.
+			// Only computers get here (see isSyncDevice), and they have Node's os module.
 			name = (require("os") as { hostname(): string }).hostname() || name;
 		} catch {
 			// Keep the generic name.
@@ -313,8 +317,11 @@ export default class TypedCalendarPlugin extends Plugin {
 	 * Whether this computer is the one that syncs. Reads the settings file
 	 * fresh: when another computer takes over, its choice arrives in the file
 	 * through the vault sync, and this plugin's in-memory copy would not know.
+	 *
+	 * Never an iPad or iPhone: CalDAV discovery needs Node's http (sync/http.ts).
 	 */
 	async isSyncDevice(): Promise<boolean> {
+		if (Platform.isMobileApp) return false;
 		const stored = normalizeSettings(await this.loadData());
 		return isSyncDevice(stored.syncDevice ?? this.settings.syncDevice, this.deviceId());
 	}
@@ -599,8 +606,8 @@ export default class TypedCalendarPlugin extends Plugin {
 		);
 		// The first computer to have a service connected becomes the one that
 		// syncs; see sync/device.ts. The save lands back here with the same key,
-		// so this does not loop.
-		if (shouldClaim(this.settings.syncDevice, configured)) {
+		// so this does not loop. A phone or tablet never takes it.
+		if (!Platform.isMobileApp && shouldClaim(this.settings.syncDevice, configured)) {
 			this.settings.syncDevice = this.thisDevice();
 			void this.saveSettings();
 		}
@@ -616,7 +623,7 @@ export default class TypedCalendarPlugin extends Plugin {
 			window.clearInterval(this.syncTimer);
 			this.syncTimer = null;
 		}
-		if (!minutes || !configured) return;
+		if (!minutes || !configured || Platform.isMobileApp) return;
 
 		this.syncTimer = window.setInterval(
 			() => {

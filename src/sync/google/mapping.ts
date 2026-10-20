@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { nodeCrypto } from "../node";
 import { markTitle, readTitle } from "../done";
 import { CalendarEvent, OccurrenceOverride } from "../../model/types";
 import { activeOverrides, applyOverride, isOccurrenceOf } from "../../model/occurrences";
@@ -125,7 +125,7 @@ export function readExdates(lines: string[], timezone: string): string[] {
 /** A short version string covering the master and every occurrence record. */
 function compositeEtag(master: GoogleEvent, instances: GoogleEvent[]): string {
 	const parts = [master.etag ?? "", ...instances.map((i) => `${i.id}:${i.etag ?? ""}:${i.status ?? ""}`).sort()];
-	return createHash("sha1").update(parts.join("|")).digest("base64").slice(0, 20);
+	return nodeCrypto().createHash("sha1").update(parts.join("|")).digest("base64").slice(0, 20);
 }
 
 function latest(...stamps: (string | undefined)[]): string | undefined {

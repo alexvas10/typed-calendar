@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { nodeCrypto } from "../node";
 import { markTitle, readTitle } from "../done";
 import { CalendarEvent, OccurrenceOverride } from "../../model/types";
 import {
@@ -292,7 +292,7 @@ function compositeEtag(master: GraphEvent, instances: GraphEvent[], skipped: str
 		...instances.filter((i) => i.type === "exception").map((i) => `${i.id}:${i.changeKey ?? ""}`).sort(),
 		...skipped,
 	];
-	return createHash("sha1").update(parts.join("|")).digest("base64").slice(0, 20);
+	return nodeCrypto().createHash("sha1").update(parts.join("|")).digest("base64").slice(0, 20);
 }
 
 /**

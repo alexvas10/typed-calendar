@@ -185,8 +185,10 @@ How it behaves:
   `requestUrl` downgrades non-standard methods to POST when a body is present,
   so PROPFIND and REPORT never reach the server (iCloud answers a POST to the
   calendar root with 400). `fetch` is blocked because iCloud sends no CORS
-  headers. Node's module has neither restriction, and is available because the
-  plugin is desktop-only.
+  headers. Node's module has neither restriction. It exists on computers only,
+  which is why calendar sync runs on a computer: on iPad and iPhone the plugin
+  falls back to `requestUrl`, enough to delete an event from iCloud but not to
+  sync.
 - One-off times are written as UTC instants rather than TZID-qualified local
   times, since a TZID without a matching VTIMEZONE is a common source of
   servers reinterpreting the hour. The original zone stays in the note.
@@ -394,7 +396,8 @@ schedule.
 
 ## Status
 
-Desktop only. Not yet implemented: recurrence beyond the subset above
+Calendar views and editing work on computers, iPad and iPhone; calendar sync
+and Google/Outlook sign-in run on a computer only. Not yet implemented: recurrence beyond the subset above
 (`BYWEEKNO`, `BYYEARDAY`, `RDATE`, "this and future" edits), iCloud
 Reminders (Apple does not expose them as standard CalDAV VTODO), and per-event
 reminders/alarms.

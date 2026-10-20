@@ -1,4 +1,4 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Platform, Setting } from "obsidian";
 import type TypedCalendarPlugin from "../../main";
 import { CALENDAR_FIELD, EventType, FieldType, TypeField } from "../model/types";
 import { autoMapCalendars } from "../sync/routing";
@@ -431,7 +431,14 @@ export class TypedCalendarSettingTab extends PluginSettingTab {
 		const chosen = this.plugin.settings.syncDevice;
 		const here = this.plugin.deviceId();
 		const onHere = Boolean(chosen?.id) && chosen?.id === here;
-		new Setting(containerEl)
+		if (Platform.isMobileApp) {
+			new Setting(containerEl)
+				.setName("Sync from this device")
+				.setDesc(
+					`Calendar sync runs on a computer, not on iPad or iPhone${chosen?.name ? `; ${chosen.name} syncs` : ""}. ` +
+						"Events edited here reach the calendars through it, once the vault has synced."
+				);
+		} else new Setting(containerEl)
 			.setName("Sync from this computer")
 			.setDesc(
 				onHere

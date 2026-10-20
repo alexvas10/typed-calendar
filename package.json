@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "rm -rf /tmp/tc-tests && esbuild tests/*.test.ts --bundle --platform=node --format=esm --outdir=/tmp/tc-tests --log-level=error && node --test /tmp/tc-tests",
-    "push:check": "esbuild tests/push.check.ts --bundle --platform=node --format=esm --outfile=/tmp/tc-push.mjs --external:node:https --external:node:http --external:node:fs --log-level=error && node /tmp/tc-push.mjs",
-    "live": "esbuild tests/live.check.ts --bundle --platform=node --format=esm --outfile=/tmp/tc-live.mjs --external:node:https --external:node:http --external:node:fs --log-level=error && node /tmp/tc-live.mjs"
+    "test": "rm -rf /tmp/tc-tests && esbuild tests/*.test.ts --bundle --platform=node --format=esm --outdir=/tmp/tc-tests --log-level=error \"--banner:js=import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" && node --test /tmp/tc-tests",
+    "push:check": "esbuild tests/push.check.ts --bundle --platform=node --format=esm --outfile=/tmp/tc-push.mjs --external:node:https --external:node:http --external:node:fs --log-level=error \"--banner:js=import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" && node /tmp/tc-push.mjs",
+    "live": "esbuild tests/live.check.ts --bundle --platform=node --format=esm --outfile=/tmp/tc-live.mjs --external:node:https --external:node:http --external:node:fs --log-level=error \"--banner:js=import{createRequire}from'node:module';const require=createRequire(import.meta.url);\" && node /tmp/tc-live.mjs"
   },
   "keywords": [],
   "license": "MIT",
